@@ -71,11 +71,12 @@ def attach_browser(address):
         raise ValueError('无法识别现有 Chrome 版本')
     major = match.group(1)
     driver_root = Path.home()/'.cache/selenium/chromedriver'
-    exact = list(driver_root.glob('*/'+major+'.*/chromedriver'))
+    driver_name = 'chromedriver.exe' if os.name == 'nt' else 'chromedriver'
+    exact = list(driver_root.glob('*/'+major+'.*/'+driver_name))
     # Chrome auto-updates before Selenium Manager has cached the new driver.
     # A driver from the immediately preceding major is compatible with the
     # current CDP in practice and avoids downloading during a live attach.
-    candidates = exact or [p for p in driver_root.glob('*/*/chromedriver')
+    candidates = exact or [p for p in driver_root.glob('*/*/'+driver_name)
                            if os.access(p, os.X_OK)
                            and p.parent.name.split('.', 1)[0].isdigit()
                            and int(p.parent.name.split('.', 1)[0]) < int(major)
