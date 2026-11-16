@@ -1,0 +1,10 @@
+# Optional isolated execution environment; monitor does not import these.
+lighter-sdk==1.1.4
+selenium==4.27.1
+# StandX BSC wallet-signature authentication; the request-body Ed25519
+# implementation is dependency-free and kept in src/standx/crypto.py.
+eth-account>=0.13,<0.14
+requests>=2.32,<3
+# The signed Lighter verifier reuses the shared PublicClient transport.
+httpx>=0.27,<1
+cryptography>=42,<50

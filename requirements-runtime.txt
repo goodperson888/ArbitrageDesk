@@ -1,0 +1,8 @@
+# Dashboard/public market data runtime; no browser or proxy dependencies.
+Flask==3.1.3
+requests==2.32.5
+python-dotenv==1.2.1
+PyYAML==6.0.3
+# The bundled macOS Python 3.9 uses LibreSSL, unsupported by urllib3 2.x.
+urllib3>=1.26.20,<2; sys_platform == 'darwin' and python_version < '3.10'
+websocket-client==1.9.0

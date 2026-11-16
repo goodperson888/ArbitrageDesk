@@ -1,0 +1,24 @@
+{
+  "account_verified": false,
+  "live_enabled": false,
+  "receipt_schema_verified": false,
+  "symbol": "BTC",
+  "browser_debugger_address": null,
+  "lighter_fee_verified": false,
+  "lighter_fee_bps": null,
+  "account_id": null,
+  "size_decimals": {},
+  "submit_labels": {"buy": null, "sell": null},
+  "response_schema": {
+    "executable_quote_verified": false,
+    "quote_endpoint": "/api/quotes/indicative",
+    "account_endpoint": null,
+    "receipt_endpoint": null,
+    "quote_fields": {},
+    "account_fields": {},
+    "receipt_collection": null,
+    "receipt_fields": {},
+    "terminal_statuses": {}
+  },
+  "note": "数量/报价/只减仓公开控件已核对。登录后验证账户、基础币精度、提交文案、RFQ 与成交回执，不能靠将标志改成 true 代替验收。当前禁止提交。"
+}

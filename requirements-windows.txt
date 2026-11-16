@@ -1,0 +1,6 @@
+# Windows x64 portable distribution; installed by CI, never at order time.
+-r requirements-runtime.txt
+-r requirements-execution.txt
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+psutil>=6,<8

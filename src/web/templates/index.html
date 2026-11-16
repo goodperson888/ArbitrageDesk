@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="local-token" content="{{ local_token }}">
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <title>Arbitrage Desk · 多平台价差</title>
+  <link rel="stylesheet" href="/static/css/style.css?v=29">
+  <link rel="stylesheet" href="/static/css/dashboard.css?v=6">
+  <script defer src="/static/vendor/echarts.min.js"></script>
+  <script defer src="/static/js/position_monitor.js?v=10"></script>
+  <script defer src="/static/js/dashboard.js?v=2"></script>
+  <link rel="stylesheet" href="/static/css/manual_close.css?v=2">
+  <script defer src="/static/js/manual_close.js?v=1"></script>
+  <script defer src="/static/js/app.js?v=68"></script>
+  <script defer src="/static/js/operations.js?v=91"></script>
+  <script defer src="/static/js/quote_freshness.js?v=1"></script>
+    <script defer src="/static/js/cross_venue.js?v=106"></script>
+  <link rel="stylesheet" href="/static/css/strategy_preview.css?v=2">
+  <script defer src="/static/js/strategy_preview.js?v=3"></script>
+</head>
+<body>
+<header class="topbar"><a class="brand" href="/"><span class="brand-icon">A</span><span>Arbitrage Desk<small>多平台价差工作台</small></span></a>
+<div class="top-status"><span class="system-dot"><i></i>本机服务</span><span class="pill neutral sr-only" id="execution-mode">监控模式 · 未启用交易</span></div></header>
+<main>
+  <section class="page-heading"><div><h1>价差工作台</h1></div>
+    <div class="toolbar"><div class="legacy-controls" hidden aria-hidden="true"><label>详情品种<select id="market-select" title="兼容旧行情详情模块">{% for symbol in symbols %}<option{% if symbol == "ETH" %} selected{% endif %}>{{ symbol }}</option>{% endfor %}</select></label>
+    <label>每腿上限 / USDC<input id="notional" type="number" min="1" max="1000000" step="1" value="{{ notional_cap }}"></label></div><button id="settings-open" class="secondary" type="button">设置</button></div>
+  </section>
+  <nav class="desk-nav" aria-label="工作台导航"><a href="#desk-run">运行控制</a><a href="#execution-history-panel" id="desk-position-status" aria-live="polite">持仓读取中</a><a href="#cross-venue-scanner">价差机会</a><a href="#execution-history-panel">执行历史</a><a href="#operations-panel">连接诊断</a></nav>
+  <section id="desk-run" aria-label="运行控制">
+    <div class="strategy-quick-view"><span id="strategy-quick-summary">当前策略</span><button type="button" class="secondary compact-action" id="strategy-preview-open">查看策略图</button></div>
+    <details class="desk-onboarding"><summary>第一次使用？查看启动步骤</summary><ol><li><a href="#cross-venue-scanner">选择参与平台和品种</a></li><li>在“设置”中确认金额、入场和平仓条件</li><li>点击“只读检查”，处理未通过项</li><li>检查通过后，手动开启实盘</li></ol><p>已有仓位时，可选择“仅管理已有仓位”；开启前仍需核对账户。</p></details>
+  <section id="execution-live-banner" class="execution-live-banner idle" role="status" aria-live="polite">
+    <div class="execution-live-main"><span class="execution-live-dot" aria-hidden="true"></span><strong id="execution-live-title">实盘未启动</strong><span id="execution-live-detail">等待启动</span></div>
+    <span id="execution-live-time" class="muted">等待状态</span>
+  </section>
+    <details id="execution-controls" class="ops-execution-card" open><summary>实盘控制</summary>
+      <div class="ops-toolbar desk-primary-actions" id="execution-primary-actions"><div class="execution-cap-field"><span>每腿金额上限</span><strong id="execution-global-cap" aria-live="polite">正在读取设置…</strong><label class="check-inline execution-cap-toggle"><input id="execution-temporary-cap" type="checkbox" autocomplete="off">本次临时调低</label><label id="execution-cap-override" hidden>临时上限 / USDC<input id="execution-cap" type="number" min="1" max="{{ notional_cap }}" step="0.1" value="{{ notional_cap }}" disabled aria-describedby="execution-global-cap execution-cap-hint"></label><small id="execution-cap-hint">正在读取最低开仓门槛…</small></div><label>本次执行模式<select id="execution-trade-mode" autocomplete="off" aria-describedby="execution-trade-mode-help"><option value="open_close" selected>自动开仓与平仓</option><option value="close_only">仅管理已有仓位（不开新仓）</option></select></label><button id="live-arm" class="execution-live-toggle" type="button" disabled aria-pressed="false" title="先完成只读检查；通过后才可开启全局实盘">开启全局实盘</button><button id="execution-check" class="secondary">只读检查</button></div>
+      <div class="ops-toolbar"><button id="execution-resume" class="secondary" type="button" hidden disabled>恢复新开仓</button><button id="execution-apply-scope" class="secondary" type="button" hidden>应用新仓平台</button><span id="execution-scope-result" class="chart-note" role="status"></span></div>
+      <p id="desk-active-scope" role="status">正在读取本次运行范围…</p>
+      <p class="desk-stop-help">停止新仓后继续管理持仓；空仓即结束。</p>
+      <details class="desk-disclosure"><summary>更多执行选项</summary><div class="ops-toolbar"><label title="累计开仓目标（单腿名义金额）">累计目标 / USDC<input id="execution-target" type="number" min="0" step="0.1" value="0"><small title="每组成对开仓按两腿较小的成交金额累计；不计平仓，不再乘杠杆">0 = 不限；按单腿名义金额累计</small></label><label class="check-inline"><input id="execution-fallback" type="checkbox" checked> 候选失败自动切换</label><button id="execution-once" class="secondary" disabled>实盘单次验证</button></div><p class="chart-note">同时持仓组数：设置 → 仓位与网格，保存后用于新开仓。</p></details>
+      <details class="desk-disclosure"><summary>运行范围与策略</summary>
+  <p id="execution-platform-state" class="execution-scope-note" role="status">正在核对运行平台…</p>
+      <p id="execution-trade-mode-help" class="execution-scope-note" role="status">正在读取当前运行模式…</p>
+      <p id="desk-scope-symbols" class="chart-note"></p>
+      <p id="execution-auto-state" class="execution-scope-note">执行范围跟随上方品种选择：全品种机会或指定品种；实盘只从当前选择中寻找合格机会</p><p id="execution-plan" class="execution-scope-note">候选失败自动切换 · 单仓循环 · 目标金额未设置；目标累计金额只影响全局持续执行，单次验证只提交一单</p>
+      <details class="execution-effective-policy"><summary>当前策略 <span class="muted" id="execution-strategy-summary">读取设置中</span></summary><p id="execution-strategy-summary-detail" class="chart-note">修改规则请打开设置。</p><button id="execution-open-settings" class="secondary" type="button">打开设置修改</button></details>
+      </details>
+      <div class="ops-toolbar execution-secondary-actions"><button id="execution-stop" class="secondary" disabled hidden title="结束本次运行；已有仓位继续按平仓规则处理，确认结束后退出">结束本次运行</button><button id="execution-reset-stop" class="secondary" disabled>核对账户状态</button></div>
+      <p id="execution-check-result" class="chart-note" role="status">检查不下单 · 有效期 2 分钟</p><details class="desk-disclosure" id="desk-runtime-details"><summary>运行明细</summary><p id="execution-process-state" class="chart-note execution-status-line" role="status">暂无执行记录</p>
+      <p id="execution-position-mode" class="chart-note" role="status"></p>
+      <p id="execution-position-monitor" class="chart-note" role="status"></p>
+      <p id="execution-route-pauses" class="chart-note" role="status" hidden></p>
+      <p id="execution-entry-risk" class="chart-note" role="status"></p>
+      </details>
+      <details class="execution-help"><summary>执行规则</summary><ul class="chart-note"><li>签名交易支持 Lighter 主网、Lighter RH、StandX 和 Arcus，通过检查后才可执行；Variational 使用独立网页路径，其他平台仅行情。</li><li>单次验证完成一轮开平仓即结束。全局实盘先接管已核对仓位，再寻找新机会；停止新开仓后继续管理持仓。</li><li>候选自动切换仅限尚未提交的确定失败；成交未知或部分成交时先核对，暂停新仓。</li><li>双腿并发减仓、各自确认。确认零成交或部分成交后按剩余仓位有限重试；未知回执、账户不符或重试耗尽时暂停核对。</li><li>正常退出须满足整组收益规则；一腿已平后的残腿继续减仓，不等待整组盈利。累计目标达到后停止新仓，最后一单可按剩余金额缩量。</li></ul></details>
+    </details>
+  </section>
+  <section class="panel cross-venue-panel" id="cross-venue-scanner" aria-label="跨平台组合扫描">
+    <div class="panel-title opportunity-heading"><div><h2>价差机会</h2></div><div class="opportunity-heading-actions"><span class="pill neutral" id="v2-api-state">连接中</span><details class="desk-display-options"><summary>显示选项</summary><div><label class="update-speed">页面更新<select id="v2-refresh-speed" aria-label="页面更新频率"><option value="0">自动</option><option value="2000">2 秒</option><option value="5000">5 秒</option><option value="10000">10 秒</option><option value="30000">30 秒</option></select></label><label class="update-speed">历史统计<select id="v2-history-window" aria-label="历史价差统计范围"><option value="86400">24 小时</option><option value="604800">7 天</option></select></label><button id="v2-auto" class="secondary compact-action" type="button" aria-pressed="true">自动更新：开</button></div></details></div></div>
+    <div class="cross-venue-controls">
+      <fieldset class="venue-picker" aria-label="参与平台"><legend>参与平台</legend><div id="v2-venue-select" role="group"></div><span id="v2-venue-hint">至少选两个平台</span></fieldset>
+      <fieldset class="symbol-picker" aria-label="对比品种"><legend>对比品种</legend><div class="symbol-mode-row"><select id="v2-symbol-mode"><option value="all">全品种机会</option><option value="selected">指定品种</option></select><input id="v2-symbol-search" type="search" placeholder="搜索指定品种" aria-label="搜索指定品种"><span id="v2-symbol-hint">扫描各平台共同目录</span></div><details class="symbol-list-disclosure" id="symbol-select-disclosure" open><summary>指定品种</summary><div id="v2-symbol-select" role="group" aria-label="指定品种列表"></div></details><details class="symbol-list-disclosure excluded-symbols-disclosure"><summary>排除不做的品种 <span id="v2-exclude-hint" class="muted">未设置</span></summary><div class="symbol-mode-row exclude-search-row"><input id="v2-exclude-search" type="search" placeholder="搜索并排除品种" aria-label="搜索并排除品种"></div><div id="v2-exclude-select" role="group" aria-label="排除品种列表"></div></details></fieldset>
+      <details class="opportunity-filter-disclosure" id="v2-opportunity-filters"><summary>机会筛选 <span id="v2-opportunity-filter-summary" class="muted">历史中心 · 偏离不限 · 次数不限 · 时间不限 · 样本不限</span></summary><p class="chart-note">筛选会影响列表及下次实盘候选；当前运行范围和已有仓位目标保持启动时的配置。</p><div class="reversion-filter-grid opportunity-filter-grid"><label>最低毛价差绝对值 / %<input id="v2-spread-min" type="number" min="0" step="0.01" value="0" aria-label="毛价差最低百分比"><small>0 = 不限</small></label><label>最高毛价差绝对值 / %<input id="v2-spread-max" type="number" min="0" step="0.01" value="0" aria-label="毛价差最高百分比"><small>0 = 不限</small></label><label>回归统计目标<select id="v2-reversion-target"><option value="center">历史中心（推荐）</option><option value="zero">回归到 0</option><option value="either">中心或 0</option></select></label><label>回归前最小偏离 / %<input id="v2-reversion-min-deviation" type="number" min="0" step="0.01" value="0"><small>0 = 不限；建议先试 0.05%–0.10%</small></label><label>统计窗口<select id="v2-reversion-window"><option value="86400">近 24 小时</option><option value="259200">近 3 天</option><option value="604800">近 7 天</option></select></label><label>近窗口至少回归 / 次<input id="v2-reversion-min-count" type="number" min="0" step="1" value="0"><small>0 = 不限</small></label><label>回归时效<select id="v2-reversion-recency-mode"><option value="hard">硬过滤：超时排除</option><option value="soft">软排序：近期优先</option></select><small>软排序只调整同等收益的优先级；修改用于下次启动</small></label><label>近期回归参考 / 小时<input id="v2-reversion-max-age" type="number" min="0" step="0.1" value="0"><small>硬过滤为时限，软排序为优先范围；0 = 不限</small></label><label>最少历史样本 / 个<input id="v2-reversion-min-samples" type="number" min="0" step="10" value="0"><small>0 = 不限</small></label></div><span id="v2-spread-filter-hint" class="sr-only"></span><span id="v2-reversion-filter-hint">未启用机会筛选；点击机会详情仍可查看近几天的每次回归。</span></details>
+      <button id="v2-scan" class="secondary" type="button">刷新报价</button>
+      <button id="v2-scan-best" class="secondary" type="button" title="切换到全部共同品种并扫描">扫描全部品种</button>
+    </div>
+    <p class="chart-note" id="v2-update-info" title="页面扫描频率不等于交易所推送频率；一轮未完成时不会重叠启动下一轮。">等待报价</p>
+    <p class="chart-note sr-only" id="v2-catalog-summary">未选择平台；选择至少两个平台后开始读取行情。</p>
+    <p class="chart-note" id="v2-scan-coverage" role="status">正在统计扫描结果…</p>
+    <div class="desk-table-tools"><span class="muted">点击方向查看明细</span><label class="check-inline"><input type="checkbox" id="desk-opportunity-columns">详细列</label></div>
+    <div class="opportunity-table" role="table" aria-label="价差机会列表">
+      <div class="opportunity-table-head" role="row"><span>品种</span><span>固定平台 A / B</span><span>优选买入 / 卖出</span><span title="A平台买入、B平台卖出的整轮净差；点击查看此方向明细">A买 / B卖 · 整轮净差</span><span title="B平台买入、A平台卖出的整轮净差；两方向各自使用真实买卖盘口">B买 / A卖 · 整轮净差</span><span title="先排触边且收益达标方向，再按预计净收益、报价新鲜度排序；尚需实盘数量和账户核验">优选方向 / 预计净收益</span><span>首档可见容量（估算）</span><span>磨损</span><span id="v2-history-header" title="优选方向历史观察范围">历史价差（24h）</span><span>报价时效</span><span>执行状态</span></div>
+      <div class="v2-result" id="v2-opportunity-result" aria-live="polite"><span class="muted">等待报价…</span></div>
+    </div>
+    <p class="chart-note opportunity-footnote" id="v2-return-basis">列表整轮收益按机会筛选的目标及统计窗口估算。</p>
+    <details class="desk-disclosure"><summary>收益怎么算</summary><ul class="chart-note"><li>整轮净价差 = 回归目标收益 − 开平仓手续费 − 同数量盘口冲击 − 预计平仓变价预算 − 资金费预留；预估净收益是对应金额。缺项保持未知。</li><li>固定 A/B，双向独立测算；优先触边且收益达标方向，再按预计净收益、报价时效排序。悬浮数值查看算式与差额。</li><li>折线 = (B Bid − A Ask) / max(A Ask, B Bid) × 10000，未扣费用，反向不能直接取负。目标取筛选所选历史窗口；旧仓目标保持冻结。</li><li>实盘按同数量深度、精度、最小订单及账户条件复核。超过 5 秒不估算收益，超过 10 秒隐藏报价。</li></ul></details>
+  </section>
+  <aside class="opportunity-drawer" id="opportunity-drawer" aria-hidden="true" aria-labelledby="opportunity-drawer-title">
+    <div class="drawer-head"><div><p class="eyebrow">机会详情</p><h2 id="opportunity-drawer-title">选择一条机会</h2></div><button id="opportunity-drawer-close" class="secondary" type="button">关闭</button></div>
+    <div id="opportunity-drawer-body" class="drawer-body"><p class="muted">选择机会查看报价、收益与执行条件。</p></div>
+  </aside>
+  <div class="notice sr-only" id="market-notice" role="status">正在等待第一条行情…</div>
+<div class="readiness-strip" hidden><span id="readiness-summary" role="status">正在检查所选平台的实盘条件…</span><button class="secondary" id="readiness-open">进入实盘检查</button></div>
+  <details class="secondary-data panel" id="history-details" aria-label="历史趋势与报价详情"><summary>单品种行情详情</summary><div class="secondary-data-body">
+  <section class="market-workspace" aria-label="价差走势与平台报价">
+    <article class="panel chart-panel"><div class="panel-title"><h2 id="chart-title">所选平台价差趋势 <span class="muted">%</span></h2><div class="chart-controls"><label class="compact-label"><span class="sr-only">平台路线</span><select id="history-pair"><option value="">全部已选路线</option></select></label><label class="compact-label"><span class="sr-only">时间范围</span><select id="history-range"><option value="300">近 5 分钟</option><option value="900">近 15 分钟</option><option value="3600" selected>近 1 小时</option><option value="21600">近 6 小时</option><option value="86400">近 24 小时</option><option value="604800">近 7 天</option></select></label><label class="compact-label"><span class="sr-only">曲线口径</span><select id="chart-mode"><option value="reference">参考走势 · 含缓存</option><option value="fresh">仅新鲜报价 · 10 秒内</option></select></label></div></div>
+      <div id="spreadChart" role="img" aria-label="所选平台组合的历史价差趋势图"></div><p id="chart-note" class="chart-note">选择机会后显示对应买入平台和卖出平台的历史价差。</p>
+    </article>
+    <div class="quote-stack" aria-label="平台报价对照">
+    {% for venue, name, tag in [('variational','Variational','V'),('lighter','Lighter','L')] %}
+    <article class="panel quote-panel"><div class="panel-title"><div class="venue-name"><span class="venue-icon {{ venue }}">{{ tag }}</span><h2>{{ name }}<small id="{{ venue }}-instrument">--</small></h2></div><span class="pill neutral" id="{{ venue }}-source">等待数据</span></div>
+      <div class="prices"><div><p>买入价 <span class="micro">ASK</span></p><strong class="price buy" id="{{ venue }}-ask">--</strong></div><div><p>卖出价 <span class="micro">BID</span></p><strong class="price sell" id="{{ venue }}-bid">--</strong></div></div>
+      <div class="quote-meta"><span id="{{ venue }}-quote-age">报价时间未知</span><span id="{{ venue }}-size">--</span></div>
+      <div class="mark-row"><span>标记价 <b id="{{ venue }}-mark">--</b></span><span id="{{ venue }}-mark-time">--</span></div>
+      <p class="feed-detail" id="{{ venue }}-feed">正在建立连接…</p>
+    </article>{% endfor %}
+
+    </div>
+  </section>
+  <section class="overview-grid" aria-label="双向对冲测算">
+    {% for key, title, label in [('a','买 Variational ＋ 卖 Lighter','V 多 / L 空'),('b','买 Lighter ＋ 卖 Variational','L 多 / V 空')] %}
+    <article class="panel direction">
+      <div class="direction-heading"><div><p class="eyebrow">{{ label }}</p><h3>{{ title }}</h3></div><div><div class="edge" id="edge-{{ key }}">--<small>%</small></div><p>盘口价差 · 未扣费用</p></div></div>
+      <p id="direction-{{ key }}-prices" class="chart-note">等待价格</p>
+      <div class="direction-metrics"><div><span>开仓名义金额</span><b id="notional-{{ key }}">--</b></div><div><span id="fee-source-{{ key }}">开仓手续费 · V 预测 / L 核验</span><b id="fees-{{ key }}">待核验</b></div><div><span>页面净价差（扣预计手续费，未扣滑点）</span><b id="net-{{ key }}">待核验</b><small id="net-note-{{ key }}">执行前会用新数量报价重新核对</small></div></div>
+      <details class="direction-details"><summary>深度、滑点观测、毛收益与资金费</summary><div class="depth-line">深度加权价差 <b id="depth-{{ key }}">--</b></div><div class="depth-line">每单位价格差 <b id="gap-{{ key }}">--</b></div><div class="depth-line"><span id="slippage-source-{{ key }}">滑点观测</span> <b id="slippage-{{ key }}">--</b></div><div class="depth-line">收敛毛收益率 / 金额 <b id="gross-{{ key }}">--</b></div><div class="depth-line"><span id="funding-source-{{ key }}">V 资金费 · 手动预测</span> <b id="funding-{{ key }}">--</b></div></details>
+    </article>{% endfor %}
+
+  </section>
+  </div></details>
+  <details class="panel operations-panel" id="operations-panel"><summary>连接与日志 <span class="muted" id="ops-summary">先做只读检查 · 不会自动下单</span></summary>
+    <div class="ops-toolbar"><button id="refresh-btn" class="secondary">重连页面数据</button><button id="execution-preview" class="secondary">复测双边报价</button><button id="execution-prepare" class="secondary">准备网页会话</button><span class="muted">详情行情：</span><span class="pill" id="stream-status" role="status">正在连接</span><span id="ops-state" role="status"></span><button class="secondary" id="ops-refresh">刷新诊断</button><a href="/api/operations/export" download>导出脱敏诊断</a></div>
+    <div hidden class="ops-stepbar" aria-label="实盘操作步骤"><div><b>1. 检查</b><span>账户、余额、持仓、费率与行情</span></div><div><b>2. 授权</b><span>单次验证或全局实盘</span></div><div><b>3. 执行</b><span>单次双腿或持续监控</span></div></div>
+    <details class="ops-detail-disclosure" id="ops-detail-disclosure"><summary>连接与阻塞详情 <span class="muted" id="ops-detail-summary"></span></summary><div class="ops-grid ops-summary-grid"><section class="ops-card"><h3>连接状态</h3><div id="ops-connections"></div></section><section class="ops-card"><h3>当前阻塞</h3><div id="ops-blockers"></div></section></div></details>
+    <p id="ops-next-step" class="ops-next-step" role="status">正在判断下一步…</p>
+    <details class="readiness-evidence"><summary>接入进度与待补数据</summary><div id="ops-evidence-checks"></div></details>
+    <details class="ops-browser-card"><summary>网页报价桥接 <span class="muted">仅 Variational · 可选 · 只读</span></summary><div class="ops-toolbar"><button id="browser-open" class="secondary">连接 Variational 页面</button><span id="browser-open-result" class="muted" role="status"></span><button id="quote-observer-start" class="secondary">监听网页报价</button><button id="quote-observer-stop" class="secondary">停止监听</button></div><p id="quote-observer-status" class="chart-note" role="status">只监听已登录的本机浏览器，不切换官网市场。</p></details>
+    <details><summary>手动成交采集 <span id="ops-capture-summary" class="muted"></span></summary><p id="manual-acceptance-result" class="chart-note" role="status"></p><p class="chart-note" id="ops-capture-note"></p><div id="ops-capture-warnings"></div><div id="ops-evidence" class="ops-table"></div><div id="ops-chains"></div><div id="ops-settlements" class="ops-table"></div></details>
+    <details><summary>运行日志 <span class="muted">最近阶段与错误</span></summary><div id="ops-log" class="ops-table"></div></details>
+      <p class="chart-note">只读检查和实盘授权分开；历史观测不会替代当前账户、余额或持仓核对。日志不包含私钥、认证头或原始请求。</p>
+  </details>
+  <details class="panel allocation-panel"><summary>自动缩量预览 <span class="muted" id="allocation-cap">全局硬上限 {{ notional_cap }} USDC</span><span id="allocation-status">等待行情</span></summary><div id="allocation-plans"></div><p class="chart-note">同一基础币数量对冲；按买入 Ask / 卖出 Bid 逐档测算。买 V / 卖 L 只扣“V 买入页面预计滑点 + L 卖出同数量盘口冲击”；买 L / 卖 V 只扣“L 买入盘口冲击 + V 卖出页面预计滑点”。双腿合计是净价差保护预算，不是平台手续费，也不是每笔固定扣除的 0.1%。观测缺失、过期或超过保护上限时，该方向标记为不可用。数量变化须重新请求 V 报价，低于平台最小订单时跳过，不提高金额；本预览按全局硬上限估算，实际执行还会使用执行区的本次上限。</p></details>
+  <div class="utility-grid">
+    <details class="panel settings-panel desk-history-compact" id="execution-history-panel" open><summary>执行历史</summary><div class="desk-table-tools"><span class="muted">点击订单查看详情</span><label class="check-inline"><input type="checkbox" id="desk-history-columns">详细列</label></div><details class="desk-disclosure"><summary>状态说明</summary><p class="chart-note">未平仓置顶，双腿合并展示。自动补查平台成交及手动平仓；费用未齐时显示暂计损益，补齐后更新最终净盈亏。</p></details><button class="secondary" id="history-refresh">刷新记录</button><p id="history-manual-close-feedback" role="status" aria-live="polite" hidden></p><div id="execution-history">尚无执行记录</div></details>
+
+  <details class="panel support-panel"><summary>数据来源与辅助工具 <span class="muted" id="quality-title">等待数据</span></summary>
+  <details class="cost-explainer"><summary>收益口径说明 · 未包含平仓成本与完整资金费</summary><p class="chart-note" id="hedge-cost-note">百分比以多腿开仓名义金额为分母，不依赖下单金额；美元金额按当前测算数量估算，不是成交后的实际利润。收敛毛收益 = 数量 ×（空腿入场价 − 多腿入场价），假设两腿之后在同一价格附近平仓。手续费优先采用官网预计费用与账户核验值。资金费按 Variational 顶部费率和实际周期估算：本腿名义金额 × 该周期费率；正费率按多头支付、空头收取处理，负费率反向。倒计时表示官网显示的距结算时间，估算无需历史记录；实际扣收以平台结算为准。此处仅含 Variational 单腿，未含 Lighter 资金费，也未从上方开仓价差中扣除。</p></details>
+  <details class="panel cost-panel" aria-label="Variational 入场成本估算"><summary>V 单平台点差与报价偏离 <span class="muted">辅助解释 · 已包含在买卖报价中</span></summary>
+    <div class="panel-title"><h2>V 入场成本 <span class="muted">本地计算 · 相对标记价</span></h2><div class="cost-heading"><span class="muted">手续费另按策略预测</span><span id="cost-status" class="pill neutral">等待报价</span></div></div>
+    <div class="cost-grid">
+      <div><p>买入报价偏离成本</p><strong class="cost-price" id="cost-buy">--</strong><p id="cost-buy-parts" class="chart-note">等待报价</p></div>
+      <div><p>卖出报价偏离成本</p><strong class="cost-price" id="cost-sell">--</strong><p id="cost-sell-parts" class="chart-note">等待报价</p></div>
+      <div><p>完整买卖点差</p><strong id="cost-spread">--</strong><p id="cost-basis" class="chart-note"></p></div>
+    </div>
+    <p id="cost-note" class="chart-note" role="status"></p>
+    <details class="explanation"><summary>成本来源与计算拆分</summary>
+      <p>官网页面显示 Spread、预计滑点 Est、滑点上限 Max 和 Fee。这里的“半点差成本”和“中间价偏离成本”是用买卖报价与标记价在本地计算的拆分项，不是官网直接返回的两项费用，也不额外收费。</p>
+      <p>中间价 M = (Ask + Bid) ÷ 2；数量为 Q。半点差成本 = Q × (Ask − Bid) ÷ 2；买入中间价偏离 = Q × (M − Mark)，卖出方向则相反。两者相加就是对应方向的报价偏离成本。</p>
+      <p id="cost-decomposition"></p>
+      <p>报价滑点：买入 = (Ask ÷ Mark − 1) × 100%，卖出 = (1 − Bid ÷ Mark) × 100%。完整点差 = (Ask − Bid) ÷ M × 100%；官网 Spread 的口径可能不同，不直接等同。负值表示相对 Mark 的有利报价。</p>
+      <p>这些是入场单腿估算；最终成交滑点需成交后核对，不含资金费、平仓及另一平台成本。<a href="https://docs.variational.io/omni/trading/fees" target="_blank" rel="noreferrer">Omni 官方手续费说明 ↗</a></p>
+    </details>
+  </details>
+  <div class="bottom-grid">
+    <article class="panel interpretation"><p class="eyebrow">报价质量</p><p id="quality-note">正在核对买卖价、时效和盘口数量。</p><div class="depth-line">测算基础数量 <b id="base-quantity">--</b></div><p id="quantity-source" class="muted"></p><small>毛价差未扣手续费、滑点与资金费，不能直接视为可成交利润。</small></article>
+    <article class="panel connection-panel"><div class="panel-title"><h2>数据连接</h2><span class="micro" id="last-observed">--</span></div><div id="connection-list"></div><p class="chart-note">前端通过 SSE 持续接收数据；连接心跳不等于行情变化。价格可能不变，更新时间会单独显示。</p></article>
+    <article class="panel"><div class="panel-title"><h2>网页报价桥接</h2><span class="pill neutral" id="bridge-state">未收到报价</span></div><p class="muted">用你已登录的 Variational 页面补充参考买卖价。只读，不碰钱包、不发订单。</p><p class="chart-note" id="bridge-note">等待网页报价；连接心跳不代表报价内容发生变化。</p><details><summary>安装与配对</summary><ol><li><a href="/static/variational-quote-bridge.zip" download>下载只读扩展</a>并解压。</li><li>Chrome 打开 chrome://extensions，启用开发者模式，加载已解压目录。</li><li>生成配对码，粘贴到扩展弹窗。</li><li>刷新 Variational BTC / ETH 页面，输入想观察的数量，等待页面报价。无需点击下单。</li></ol><button id="pair-btn" class="secondary">生成本机配对码</button><input id="pair-token" type="text" readonly hidden aria-label="本机只读配对码"><p class="chart-note">配对保存在本机，服务重启后继续有效。保持官网对应市场页面打开并填入数量；浏览器休眠、断网或官网停止报价时会显示过期。</p></details></article>
+  </div>
+  <div class="explanation"><h3>趋势图怎么看</h3><p>每条线代表一个实际观察到的“买入平台 → 卖出平台”路线。正数表示卖出 Bid 高于买入 Ask，仍需扣除费用、滑点并通过执行前检查。</p><p>参考模式会保留缓存报价，适合观察走势；新鲜模式只显示两边十秒内的报价，不代表一定成交。</p></div>
+  </details>
+  <details class="panel settings-panel" id="connection-settings"><summary>平台连接 <span class="muted" id="credential-summary">本机配置 · 未启用交易</span></summary>
+    <details class="settings-subsection proxy-settings" open><summary><span>网络与本地代理</span><span class="platform-form-meta">行情 · API · 新浏览器连接</span><b id="proxy-form-status" class="platform-form-status warn">读取中</b></summary>
+      <form id="network-form" autocomplete="off"><div class="settings-grid">
+        <label>本地代理地址<input id="proxy-url" type="text" inputmode="url" spellcheck="false" placeholder="http://127.0.0.1:12000"></label>
+      </div><div class="settings-save-row"><p class="chart-note">留空表示直连；支持 http://、https://、socks5:// 和 socks5h://。修改后会应用到行情、API 鉴权和新打开的浏览器连接。</p><div class="actions"><button id="save-network" type="submit">保存并应用</button><span id="network-result" role="status"></span></div></div></form>
+    </details>
+    <details class="platform-settings" open><summary>平台连接与密钥状态 <span class="muted">密钥只保存在本机</span></summary><div id="platform-settings-list" class="platform-settings-list">
+      <div class="platform-setting-row" data-platform-setting="variational"><strong>Variational</strong><span>浏览器会话</span><b class="warn">需要在执行检查中连接</b></div>
+      <div class="platform-setting-row" data-platform-setting="lighter"><strong>Lighter 主网</strong><span>API 私钥 + 账户索引</span><b>下方填写并只读验证</b></div>
+      <div class="platform-setting-row" data-platform-setting="lighter_rh"><strong>Lighter RH</strong><span>独立网络和独立密钥</span><b class="warn">未配置</b></div>
+      <div class="platform-setting-row" data-platform-setting="standx"><strong>StandX</strong><span>BSC 钱包签名</span><b class="warn">未配置</b></div>
+      <div class="platform-setting-row" data-platform-setting="arcus"><strong>Arcus</strong><span>Ed25519 API Signing Key</span><b class="warn">未配置</b></div>
+    </div><p class="chart-note">各平台独立配置账户与密钥；未通过鉴权和执行核验的平台仅展示行情。</p></details>
+    <details class="platform-credential-form">
+      <summary><span>Lighter 主网 API 密钥</span><span class="platform-form-meta">API · 只读验证</span><b id="lighter-form-status" class="platform-form-status warn">未配置</b></summary>
+      <form id="credentials-form" autocomplete="off"><div class="settings-grid">
+      <label>账户索引<input id="lighter-account" type="number" min="0" step="1" value="750057" required></label>
+      <label>API key 索引<input id="lighter-key-index" type="number" min="4" max="254" step="1" placeholder="以 API Keys 页面为准" required></label>
+      <label class="secret-field">API 私钥<input id="lighter-private-key" type="password" autocomplete="new-password" spellcheck="false" placeholder="新密钥仅写入本机，不回显" required></label></div>
+      <p class="chart-note">密钥仅在本机保存，提交后清空输入。费率核验有效 5 分钟，过期需复查。</p>
+      <button id="save-credentials" type="submit">验证并保存到本机</button><button id="recheck-credentials" class="secondary" type="button">只读复查已保存密钥</button><p id="credential-result" class="chart-note" role="status"></p></form>
+      
+    </details>
+    <details class="platform-credential-form"><summary><span>Lighter RH（Robinhood Chain）API 密钥</span><span class="platform-form-meta">API · 只读验证</span><b id="lighter-rh-form-status" class="platform-form-status warn">未配置</b></summary>
+      <form id="lighter-rh-credentials-form" autocomplete="off"><div class="settings-grid">
+        <label>账户索引<input id="lighter-rh-account" type="number" min="0" step="1" required></label>
+        <label>API key 索引<input id="lighter-rh-key-index" type="number" min="4" max="254" step="1" required></label>
+        <label class="secret-field">API 私钥<input id="lighter-rh-private-key" type="password" autocomplete="new-password" spellcheck="false" placeholder="只发送到本机" required></label>
+      </div><p class="chart-note">RH 使用独立 API、USDG 结算和独立签名域，不复用 Lighter 主网或 MetaMask 私钥。请填创建该 API key 时一次性保存的 80 位 API 私钥；API Keys 表里的“仅做市商·已禁用”不代表 key 被禁用。保存前只读检查账户和当前 ETH 市场，不发单。</p>
+      <button id="save-lighter-rh-credentials" type="submit">验证并保存 RH 密钥</button><button id="recheck-lighter-rh-credentials" class="secondary" type="button">只读复查已保存密钥</button><p id="lighter-rh-credential-result" class="chart-note" role="status"></p></form>
+    </details>
+    <details class="platform-credential-form"><summary><span>StandX BSC 钱包</span><span class="platform-form-meta">钱包 · 只读验证</span><b id="standx-form-status" class="platform-form-status warn">未配置</b></summary>
+      <form id="standx-credentials-form" autocomplete="off"><div class="settings-grid">
+        <label>钱包地址<input id="standx-address" type="text" spellcheck="false" placeholder="0x…" required></label>
+        <label>链<select id="standx-chain"><option value="bsc">BSC</option></select></label>
+        <label class="secret-field">钱包私钥<input id="standx-private-key" type="password" autocomplete="new-password" spellcheck="false" placeholder="只发送到本机，不回显" required></label>
+      </div><p class="chart-note">StandX 官方登录需要钱包签名和临时请求密钥；验证只登录，不下单。钱包私钥不会返回页面，也不会写入日志。</p>
+      <button id="save-standx-credentials" type="submit">验证并保存 StandX 钱包</button><button id="recheck-standx-credentials" class="secondary" type="button">只读复查已保存钱包</button><p id="standx-credential-result" class="chart-note" role="status"></p></form>
+    </details>
+    <details class="platform-credential-form"><summary><span>Arcus API</span><span class="platform-form-meta">Ed25519 · 只读鉴权 / 实盘待授权</span><b id="arcus-form-status" class="platform-form-status warn">未配置</b></summary>
+      <form id="arcus-credentials-form" autocomplete="off"><div class="settings-grid">
+        <label>钱包地址<input id="arcus-address" type="text" spellcheck="false" placeholder="Arcus 钱包地址" required></label>
+        <label>账户索引<input id="arcus-account" type="number" min="0" step="1" value="0" required></label>
+        <label class="secret-field">API Signing Key<input id="arcus-signing-key" type="password" autocomplete="new-password" spellcheck="false" placeholder="64 位十六进制，只发送到本机" required></label>
+      </div><p class="chart-note">账户索引须对应 Arcus API Keys 页的 Subaccount #，使用独立 Ed25519 Signing Key。保存仅做只读核验，成功后清空输入；复查无需重填。交易需另行通过只读检查并手动开启实盘。</p>
+      <button id="save-arcus-credentials" type="submit">验证并保存 Arcus 密钥</button><button id="recheck-arcus-credentials" class="secondary" type="button">只读复查已保存密钥</button><p id="arcus-credential-result" class="chart-note" role="status"></p></form>
+    </details>
+    <details class="platform-credential-form"><summary><span>Variational 浏览器</span><span class="platform-form-meta">浏览器 · 页面连接</span><b id="variational-form-status" class="platform-form-status warn">需要连接</b></summary>
+      <p class="chart-note">执行页中连接已登录浏览器；专用窗口会尽量后台运行，钱包弹出人工确认时才需要前台操作。</p>
+      <details class="settings-subsection platform-cost-subsection"><summary><span>平台成本与资金费</span><span class="platform-form-meta">官网动态数据优先 · 手动兜底</span></summary>
+        <div class="settings-grid">
+          <label>手动预测费率 / %<input id="variational-fee-bps" type="number" value="0" min="0" max="100" step="0.001"></label><label>费率数据状态<select id="variational-fee-status"><option value="known">官网缺失时使用手动预测</option><option value="unknown">保持未知</option></select></label>
+          <label>手动预测资金费 / 8 小时 %<input id="funding-bps" type="number" value="0.01" min="-100" max="100" step="0.001"></label><label>资金费数据状态<select id="funding-status"><option value="known">官网缺失时使用手动预测</option><option value="unknown">保持未知</option></select></label>
+        </div>
+        <p class="chart-note">网页报价桥接收到的当前费率和资金费会优先使用；这里的数值只用于缺少官网字段时的净价差预测，不会覆盖实际成交结算。</p>
+      </details>
+      <details class="advanced-help"><summary>浏览器与验收说明</summary><p class="chart-note">专用浏览器与日常 Chrome 分开保存，不搬运日常 Cookie 或钱包数据。只读字段验收命令和离线演练脚本保留在项目文档中。</p><p class="chart-note"><code>scripts/audit_variational.py</code> 只读、不发单；<code>scripts/rehearse_execution.py</code> 使用受控回执、不连接账户。</p></details>
+    </details>
+
+    <details><summary>自动下单准备进度</summary><div id="execution-progress"></div><p class="chart-note">离线演练：<code>.venv/bin/python -B scripts/rehearse_execution.py</code>。使用受控回执，不连接账户、不发送订单；真实 RFQ 和成交回执仍待验收。</p></details></details>
+  <details class="panel settings-panel" id="strategy-settings" open><summary><span>交易策略</span><span class="muted">保存到本机</span></summary>
+    <div class="strategy-quick-view"><span id="channel-settings-summary">通道未启用</span><button type="button" class="secondary" id="channel-settings-open">配置通道与预览</button></div>
+    <details class="settings-subsection " id="entry-policy-settings" open><summary><span>回归基准与入场条件</span><span class="platform-form-meta">整轮收益条件</span></summary>
+      <div class="settings-grid">
+        <label id="execution-close-target-field"><span>开平仓回归目标</span><select id="execution-close-target"><option value="center">历史中心</option><option value="zero">回归到 0</option></select><small title="开仓计算到此目标的净空间；单开和整轮网格冻结同一目标，平仓共用">旧仓目标保持不变</small></label>
+        <label id="execution-target-window-field"><span>中心统计窗口</span><select id="execution-target-window"><option value="86400">近 24 小时</option><option value="259200">近 3 天</option><option value="604800">近 7 天</option></select><small title="至少30个有效样本才允许中心入场；新一轮更新中心，已有仓位不漂移">至少 30 个有效样本</small></label>
+        <label id="min-spread-field"><span>最低预计净回归空间 / bps</span><input id="min-spread" aria-describedby="min-spread-help" type="number" value="5" min="0" step="0.1"><small id="min-spread-help" class="field-help" title="预计回到所选目标，扣完整开平仓成本后至少剩多少；5 bps = 0.05%">扣成本后门槛；5 bps = 0.05%</small></label>
+        <label>入场预留 / bps<input id="execution-safety-margin" aria-describedby="execution-safety-margin-help" type="number" value="0" min="0" max="50" step="0.1"><small id="execution-safety-margin-help" class="field-help" title="首腿提交前额外保留；成交后允许消耗，仍守最低净回归空间和等量对冲；0 = 不额外预留">提高首腿前门槛，成交后可消耗；双腿等量。</small></label>
+        <label id="execution-entry-mode-field"><span>入场方式</span><select id="execution-entry-mode" aria-describedby="execution-entry-mode-help"><option value="fixed">固定净回归空间门槛</option><option value="adaptive_quantile">自适应历史分位 + 净空间门槛</option><option value="channel">通道触边 + 整轮净收益门槛</option></select><small id="execution-entry-mode-help" class="field-help" title="按相同统计窗口额外检查历史分位，仍须满足最低净回归空间及预留">历史分位模式会额外核验分位门槛。</small></label>
+        <label id="max-spread-field"><span>最高预计净回归空间 / bps</span><input id="max-spread" aria-describedby="max-spread-help" type="number" value="50" min="0" step="0.1"><small id="max-spread-help" class="field-help" title="净回归空间高于此值也不入场；防止异常报价；须容纳最低门槛 + 预留">超过此值则等待，用于拦截异常报价。</small></label>
+        <label id="execution-entry-quantile-field"><span>入场分位 / %</span><input id="execution-entry-quantile" type="number" min="50" max="99.9" step="0.1" value="90"><small>每条有向路线独立取高分位，反向路线独立统计</small></label>
+        <label id="execution-entry-min-samples-field"><span>自适应入场最少样本</span><input id="execution-entry-min-samples" type="number" min="30" max="100000" step="10" value="300"></label>
+        <label>资金费估算方式<select id="execution-funding-mode"><option value="fixed">固定整轮预算</option><option value="dynamic">平台预测 + 额外预留</option></select><small>动态模式复用平台长连接的小时费率，按多空方向及跨结算次数估算；缺失或过期使用固定兜底</small></label>
+        <label>固定 / 兜底资金费预算 / bps<input id="execution-funding-reserve" type="number" min="0" max="10000" step="0.1" value="6"><small>双腿整轮合计；固定模式直接使用，动态数据不齐时兜底。实际盈亏使用平台已结算资金费</small></label>
+        <label>资金费预计持仓 / 分钟<input id="execution-funding-hold" type="number" min="1" max="10080" step="1" value="60"><small>仅用于开仓资金费预测，不会改变最长持仓或强制平仓；后续小时暂沿用当前预测费率</small></label>
+        <label>动态资金费额外预留 / bps<input id="execution-funding-extra" type="number" min="0" max="10000" step="0.1" value="1"><small>在预计双腿净支出之上额外保留；预计净收入只展示，不增加可用入场利润</small></label>
+      </div>
+      <p id="entry-threshold-preview" class="settings-rule-preview" role="status" aria-live="polite">正在读取入场门槛…</p>
+      <details class="desk-disclosure"><summary>参数说明</summary><p class="chart-note settings-section-note">净回归空间按预计回到本轮目标的双腿收益，扣除开平仓手续费、盘口成本、预计平仓变价预算及整轮资金费预算。双向都核算；当前毛价差为负也可评估，预计净空间不达标就等待。情景估算不代表未来成交收益。</p></details>
+    </details>
+    <details class="settings-subsection " id="position-policy-settings" open><summary><span>仓位与网格</span><span class="platform-form-meta">金额上限 · 杠杆 · 单开 / 网格</span></summary>
+      <div class="settings-grid">
+        <label>每腿金额上限 / USDC<input id="position-size" type="number" value="{{ notional_cap }}" min="1" step="0.1" aria-describedby="position-size-help"><small id="position-size-help" class="field-help">默认跟随此设置；保存后用于下一笔新仓，执行区可临时调低</small></label>
+        <label>最大总持仓金额 / USDC<input id="max-total-position-notional" type="number" value="{{ max_total_position_notional }}" min="0" step="0.1"><small>各组较小腿金额合计；0 = 不限。调低不强平。</small></label>
+        <label>最大同时持仓 / 组<input id="max-positions" aria-describedby="max-positions-help" type="number" value="1" min="1" max="100" step="1"><small id="max-positions-help" class="field-help">每组两腿，网格每层一组。保存即用于新仓，调低不强平。</small></label>
+        <label>统一杠杆 / 倍<input id="leverage" type="number" value="5" min="1" max="100" step="1"></label>
+        <label id="position-mode-field">持仓模式<select id="position-mode"><option value="single">单开：已有同品种仓位时不加仓</option><option value="spread_grid">价差网格：价差逐格扩大时加仓</option></select></label>
+        <label id="grid-step-field" hidden>网格间距 / %<input id="grid-step" type="number" value="0.05" min="0.001" max="100" step="0.001"><small>扣整轮成本后净回归空间的增量；0.05% = 5 bps</small></label>
+        <label id="grid-layer-notional-field" hidden>网格每层每腿上限 / USDC<input id="grid-layer-notional" type="number" value="12" min="1" step="0.1"><small>同时受全局及本次每腿硬上限约束</small></label>
+        <label id="grid-max-layers-field" hidden>网格最大层数<input id="grid-max-layers" type="number" value="3" min="1" max="100" step="1"><small>还受最大同时持仓组数限制；每格一轮只使用一次</small></label>
+        <label id="grid-total-notional-field" hidden>网格总金额上限 / USDC<input id="grid-total-notional" type="number" value="36" min="1" step="0.1"><small>按各层较大腿金额合计；全局总上限更小时优先生效</small></label>
+      </div>
+      <p id="entry-limits-status" class="chart-note" role="status" aria-live="polite">持仓上限：正在读取生效状态…</p>
+      <p id="grid-policy-help" class="chart-note settings-section-note" hidden>一轮只做同一平台组合、品种和方向。新层扣整轮成本后的净回归空间，须高于首层阶梯目标且比上一成交层至少好一格，并额外保留入场预留；部分层退出不复用格位。网格各层共用首层冻结目标，按下方平仓触发方式、最低盈利和成本预留退出，最长持仓及亏损保护继续生效。切换模式需整组结束后生效；单次验证只验证首层开仓→平仓。</p>
+      <details class="desk-disclosure"><summary>参数说明</summary><p class="chart-note settings-section-note">每腿金额同时受全局硬上限、本次执行上限及剩余持仓额度约束；网格还受每层和整组上限约束。杠杆不会放大这里填写的每腿名义金额。</p></details>
+    </details>
+    <details class="settings-subsection execution-strategy-settings" id="close-policy-settings" open><summary><span>平仓条件</span><span class="platform-form-meta">回归目标 · 净盈利 · 持仓保护</span></summary>
+      <div class="settings-grid">
+        <label id="close-mode-field"><span>平仓触发方式</span><select id="close-mode"><option value="convergence">收敛且净盈利（兼容原收敛模式）</option><option value="convergence_and_profit">收敛且达到净盈利</option><option value="profit">达到净盈利</option><option value="convergence_or_profit">收敛或盈利（净收益须达标）</option><option value="disabled">关闭主动平仓（仅保留保护）</option></select></label>
+        <label id="close-convergence-basis-field" hidden><span>收敛计算方式</span><select id="close-convergence-basis"><option value="remaining">当前价差不超过目标容差</option></select><small>决定下面的 bps 是目标容差还是收窄幅度</small></label>
+        <label id="close-convergence-bps-field"><span id="close-convergence-bps-label">目标容差 / bps</span><input id="close-convergence-bps" type="number" value="2" min="0" step="0.1"><small id="close-convergence-bps-help">接近本轮冻结目标的容差；越过目标后仍需满足净盈利</small></label>
+        <label id="close-min-profit-usdc-field"><span>最低净盈利 / USDC</span><input id="close-min-profit-usdc" aria-describedby="close-min-profit-usdc-help" type="number" value="0" min="0" step="0.01"><small id="close-min-profit-usdc-help" class="field-help">须同时满足收益率门槛，另加成本预留。</small></label>
+        <label id="close-min-profit-bps-field"><span>最低净收益 / bps</span><input id="close-min-profit-bps" aria-describedby="close-min-profit-bps-help" type="number" value="0" min="0" step="0.1"><small id="close-min-profit-bps-help" class="field-help">按双腿平仓金额之和计算，须同时满足金额门槛。</small></label>
+        <label id="close-cost-reserve-usdc-field"><span>平仓成本预留 / USDC</span><input id="close-cost-reserve-usdc" aria-describedby="close-cost-reserve-usdc-help" type="number" value="0" min="0" step="0.01"><small id="close-cost-reserve-usdc-help" class="field-help">额外加在最低净盈利金额上。</small></label>
+        <label id="close-max-hold-minutes-field"><span>最长持仓 / 分钟</span><input id="close-max-hold-minutes" aria-describedby="close-max-hold-minutes-help" type="number" value="60" min="0" step="1"><small id="close-max-hold-minutes-help" class="field-help">最长持仓保护可能亏损退出；0 = 不设置最长时限</small></label>
+        <label>金额止损<select id="loss-limits" aria-describedby="loss-limits-help"><option value="off">关闭固定亏损限额</option><option value="keep">保留已有亏损限额</option></select><small id="loss-limits-help" class="field-help">触发单笔或每日限额可能亏损退出；关闭仅取消金额止损。</small></label>
+      </div>
+      <details class="desk-disclosure"><summary>参数说明</summary><p class="chart-note settings-section-note">正常主动平仓按实际数量的可成交报价，扣除开平仓费用及变价预算、计入已结算资金费后，须净盈利为正并同时满足金额和收益率门槛。单开与网格各层都按所选触发方式退出；收敛判断共用开仓时冻结的目标，主动平仓前再核验实际可成交净盈利。最长持仓、亏损保护及剩余腿减仓仍可能亏损退出。“收敛且净盈利”的兼容选项与“收敛且达到净盈利”采用相同盈利要求。</p></details>
+    </details>
+    <details class="settings-subsection " id="execution-protection-settings"><summary><span>执行保护与回补</span><span class="platform-form-meta">价格保护 · 对冲窗口 · 暂停规则</span></summary>
+      <div class="settings-grid">
+        <label>滑点保护上限 / %<input id="slippage" aria-describedby="slippage-help" type="number" value="0.1" min="0" max="1" step="0.001"><small id="slippage-help" class="field-help">盘口冲击与变价预算合计不得超过此保护上限；0.1% = 10 bps</small></label>
+        <label>盘口使用率 / %<input id="book-utilization" aria-describedby="book-utilization-help" type="number" value="80" min="0.1" max="100" step="0.1"><small id="book-utilization-help" class="field-help" title="仅用于支持原生盘口的平台组合。按实际买卖方向，在价格保护和收益范围内取双边较小深度，再乘使用率；原订单小于该上限就不缩量。保存后用于下一次开仓，不改变已有仓位或首腿成交后的对冲数量。">80% 预留两成盘口；100% 关闭。小额订单不打折，平仓不受影响。</small></label>
+        <label>每腿价格变动预算 / bps<input id="execution-price-movement" aria-describedby="execution-price-movement-help" type="number" value="2" min="0" max="100" step="0.1"><small id="execution-price-movement-help" class="field-help">用于下单价格保护和预计平仓预算；开仓固定变价不再重复扣减，由入场预留覆盖。基础值与同路线实际执行窗口变价 P90 取大值；近24小时至少5次、最多64次</small></label>
+        <label>补齐对冲提交窗口 / 秒<input id="hedge-max-delay" type="number" value="5" min="0.25" max="30" step="0.25"><small>从首腿提交开始计时；超过窗口停止补齐并处理已知敞口，未知回执先核对</small></label>
+        <label>第二腿保护重报价次数<input id="second-leg-retries" aria-describedby="second-leg-retries-help" type="number" value="1" min="0" max="2" step="1"><small id="second-leg-retries-help" class="field-help">在对冲窗口及原价格保护内重新报价；未知成交回执先核对，不能盲目重下</small></label>
+        <label>连续回补暂停次数<input id="route-rollback-limit" type="number" value="2" min="1" max="10" step="1"><small>按平台组合、品种和方向分别计数；完整配对后清零</small></label>
+        <label>路线暂停时间 / 分钟<input id="route-rollback-cooldown" type="number" value="15" min="1" max="1440" step="1"><small>暂停新开仓，已有仓位继续平仓；重启保留暂停记录</small></label>
+        <label>每日开仓尝试上限 / 次<input id="max-trades" aria-describedby="max-trades-help" type="number" value="100" min="1"><small id="max-trades-help" class="field-help">按开仓尝试计数，包含被拒绝及回补的尝试；不是成交笔数</small></label>
+      </div>
+      <details class="desk-disclosure"><summary>参数说明</summary><p class="chart-note settings-section-note">入场预留决定多大净回归空间才开始；变价预算用于估算成交成本；滑点上限限制可接受的价格偏移。三者作用不同，预留放在上方“入场条件”中配置。</p></details>
+      <details class="advanced-help settings-section-note"><summary>回补后的自动缩量规则</summary><p class="chart-note">第二腿确认零成交或部分成交后，同品种同方向下一次每腿金额上限减半；成功配对后每次恢复25%，24小时无此记录恢复原上限。缩量不满足平台最小下单条件就等待。连续回补按路线暂停新开仓，已有持仓继续监控和平仓。</p></details>
+    </details>
+    <div class="settings-save-row"><p class="chart-note">提交前仍核验报价、费用与账户；资料不全则等待。</p><div class="actions"><button id="save-config">保存配置</button><span id="config-result" role="status"></span></div></div>
+    <details class="settings-subsection settings-check-section"><summary><span>配置检查结果</span><span class="platform-form-meta">实盘开关仍需单独只读检查</span></summary><p id="preflight-note" class="chart-note"></p></details>
+  </details>
+  </div>
+  <dialog id="settings-dialog" class="settings-dialog" aria-labelledby="settings-title">
+    <div class="settings-shell"><div class="settings-dialog-head"><div><p class="eyebrow">本机设置</p><h2 id="settings-title">设置</h2></div><button id="settings-close" class="secondary" type="button">关闭</button></div><p class="chart-note">保存不会自动开启实盘。</p><div id="settings-dialog-body"></div></div>
+  </dialog>
+  <dialog id="strategy-preview-dialog" class="strategy-preview-dialog" aria-labelledby="strategy-preview-title">
+    <div class="strategy-preview-shell">
+      <div class="strategy-preview-head"><div><p class="eyebrow">策略预览</p><h2 id="strategy-preview-title">通道与交易规则</h2></div><button type="button" class="secondary" id="strategy-preview-close">关闭</button></div>
+
+      <p class="chart-note" id="strategy-preview-axis">全局策略 · 各品种与平台组合独立计算通道。</p>
+      <form id="channel-settings-form">
+        <div class="strategy-preview-layout">
+          <div class="strategy-preview-controls">
+            <label>通道类型<select id="channel-method"><option value="quantile">历史分位通道</option><option value="bollinger">布林带（均值 ± 标准差）</option><option value="robust">稳健通道（中位数 ± MAD）</option><option value="fixed">固定价差区间</option></select></label>
+            <label data-channel-stat>统计窗口<select id="channel-window"><option value="900">15 分钟</option><option value="1800">30 分钟</option><option value="3600">1 小时</option><option value="21600">6 小时</option><option value="86400">24 小时</option><option value="604800">7 天</option></select></label>
+            <label data-channel-kind="quantile">上边界分位 / %<input id="channel-quantile" type="number" min="50.1" max="99.9" step="0.1" value="90"><small>90 对应下边界 P10、上边界 P90。</small></label>
+            <label data-channel-kind="bollinger robust">波动倍数<input id="channel-multiplier" type="number" min="0.1" max="10" step="0.1" value="2"></label>
+            <label data-channel-kind="fixed">下边界 / bps<input id="channel-lower" type="number" min="-9998" max="9998" step="0.1" value="-20"></label>
+            <label data-channel-kind="fixed">上边界 / bps<input id="channel-upper" type="number" min="-9998" max="9998" step="0.1" value="20"></label>
+            <label>交易模式<select id="channel-exit-mode"><option value="reversion">回归指定比例且盈利后退出</option><option value="opposite">到对侧且盈利后退出，等待反向入场</option></select></label>
+            <label id="channel-reversion-field">向入场时中心回归 / %<input id="channel-reversion" type="number" min="0.1" max="100" step="0.1" value="60"><small>以入场到冻结中心的距离计算。</small></label>
+            <details><summary>宽度与样本限制</summary><label data-channel-stat>最少有效样本<input id="channel-min-samples" type="number" min="30" max="100000" step="1" value="30"><small>约 30 秒一个样本；30 个至少需 14.5 分钟。</small></label><label>最小通道总宽度 / bps<input id="channel-min-width" type="number" min="0" max="10000" step="0.1" value="0"><small>0 = 不额外扩宽。</small></label><label>最大通道总宽度 / bps<input id="channel-max-width" type="number" min="0" max="10000" step="0.1" value="0"><small>0 = 不限；超过上限暂停新仓，不压窄行情。</small></label></details>
+          </div>
+          <div class="strategy-preview-visual"><p id="strategy-preview-status" role="status" aria-live="polite"></p><div id="strategy-preview-chart" role="img" aria-label="价差通道及开平仓位置示意"></div><p id="strategy-preview-description" class="chart-note"></p><div id="strategy-preview-positions"></div></div>
+        </div>
+      </form>
+      <div class="strategy-preview-footer"><p id="strategy-preview-apply-note" class="chart-note">旧仓全部结束后启用新策略；旧仓目标保持冻结。</p><span id="strategy-preview-error" role="alert"></span><button type="button" id="channel-settings-save">保存并使用通道策略</button></div>
+    </div>
+  </dialog>
+  <footer>Arbitrage Desk <span>报价仅供参考，以实际成交为准</span><a href="http://127.0.0.1:5002/docs" target="_blank" rel="noreferrer">本机 API 文档 ↗</a><a href="https://docs.variational.io/technical-documentation/api" target="_blank" rel="noreferrer">公开行情说明 ↗</a></footer>
+</main>
+</body></html>

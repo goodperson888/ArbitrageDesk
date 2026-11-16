@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Variational 只读报价桥接",
+  "version": "1.2.0",
+  "description": "只读同步 BTC/ETH 网页报价及脱敏的手动订单、成交、持仓和结算观测；不读取认证信息、不下单。",
+  "permissions": ["storage"],
+  "host_permissions": ["http://127.0.0.1:5001/*"],
+  "background": {"service_worker": "background.js"},
+  "action": {"default_popup": "popup.html"},
+  "content_scripts": [
+    {"matches": ["https://omni.variational.io/*"], "js": ["capture.js"], "run_at": "document_start", "world": "MAIN"},
+    {"matches": ["https://omni.variational.io/*"], "js": ["forward.js"], "run_at": "document_start"}
+  ]
+}

@@ -1,0 +1,158 @@
+# 对冲刷分配置文件
+
+# Variational配置 (浏览器自动化)
+variational:
+  api:
+    base_url: "https://omni-client-api.prod.ap-northeast-1.variational.io"
+    cache_seconds: 10
+  symbol_aliases:
+    US100: US100S  # 仅行情映射：Swap 与永续合约不同
+  # 浏览器设置
+  browser:
+    headless: false  # 是否无头模式
+    timeout: 30  # 超时时间(秒)
+    page_load_timeout: 60
+  
+  # 交易对配置
+  markets:
+    - US100
+  
+  # 交易参数
+  trading:
+    position_size: 1000  # 每次交易金额(USDC)
+    max_positions: 5  # 最大同时持仓数
+    leverage: 10  # 杠杆倍数
+  
+  # 登录信息 (需要在.env中设置)
+  wallet_address: ""  # 钱包地址
+
+# Lighter配置 (API)
+lighter:
+  # API配置
+  api:
+    base_url: "https://mainnet.zklighter.elliot.ai"
+    api_key_index: 5  # API key索引 (0-254, 0-3保留给桌面/移动端)
+  
+  # 交易对配置
+  markets:
+    - BTC
+    - ETH
+    - US100
+  
+  # 交易参数
+  trading:
+    position_size: 1000  # 每次交易金额(USDC)
+    max_positions: 5  # 最大同时持仓数
+    leverage: 10  # 杠杆倍数
+
+# Robinhood Chain 上的独立 Lighter Domain（只读接入）
+lighter_rh:
+  api:
+    base_url: "https://api.rh.lighter.xyz"
+    ws_url: "wss://api.rh.lighter.xyz/stream"
+    request_timeout: 20
+  markets: []  # 留空时读取 RH 完整目录；可填 BTC、ETH 或股票永续代码
+  trading:
+    position_size: 1000
+    max_positions: 5
+    leverage: 10
+
+# 其他交易所公共只读行情；当前不接入密钥和下单
+binance:
+  api:
+    base_url: "https://fapi.binance.com"
+  markets: []
+gate:
+  api:
+    base_url: "https://api.gateio.ws/api/v4"
+  markets: []
+okx:
+  api:
+    base_url: "https://www.okx.com"
+  markets: []
+
+# 对冲策略配置
+strategy:
+  mode: monitor  # 未验收真实成交适配器前禁止 live
+  state_path: data/hedge_state.json
+  trading:
+    position_size: 1  # 单次每腿名义金额上限；低于平台最小订单会跳过
+    max_positions: 1
+    max_total_position_notional: 0  # 同时持仓的配对名义总额；0 = 不限制
+    leverage_mode: verify_only  # verify_only 只读；enforce_common 才签名设置共同杠杆
+    leverage: 5
+    second_leg_retries: 1  # 第一腿成交后，第二腿保护条件失败时最多重报价次数
+  # 价差阈值 (基点)
+  spread_threshold:
+    min: 5  # 最低预计净回归空间；扣整轮开平仓成本、每腿价格预算与资金费预算，单位 bps
+    max: 50  # 最高预计净回归空间，超出则等待核实；单位 bps
+  position_policy:
+    mode: single  # single 单开；spread_grid 价差网格（最大持仓数需至少为最大层数）
+    step_bps: 5  # 相对上层实际入场净回归空间增加的 bps，提交前另加预留
+    max_layers: 3
+    layer_notional_usdc: 12
+    total_notional_usdc: 36  # 整组各层较大腿金额合计，始终为有限正数
+  entry_policy:
+    calculation_version: 2  # 开平仓共享目标、按完整开平仓成本计算净回归空间
+    target_window_seconds: 604800  # 开平仓共享的历史中心/分位数统计窗口；新仓冻结目标
+    funding_reserve_bps: 2  # 整轮双腿资金费保守预算；明确填写，不按未知或预期收入处理
+    mode: fixed  # fixed 固定门槛；adaptive_quantile 使用历史 P90/P10 极端价差
+    quantile: 90
+    min_samples: 300
+  # 开平仓共享目标。新仓目标冻结，网格整轮复用首层目标；退出仍检查实际净收益。
+  close_policy:
+    mode: convergence  # convergence / convergence_and_profit / profit / convergence_or_profit / disabled
+    target_mode: center  # center 历史中心（至少30个样本）；zero 回到 0
+    convergence_basis: remaining  # 新策略统一按当前有向 BBO 价差到冻结目标的距离
+    convergence_bps: 2  # 当前有向价差 <= 冻结目标 + 此容差时判断为收敛
+    min_profit_usdc: 0  # 最低平仓净收益，亦折算为入场净空间要求
+    min_profit_bps: 0  # 双腿名义金额口径的最低收益；0 表示不限制
+    cost_reserve_usdc: 0  # 平仓费和资金费未知时预留的保守金额
+    max_hold_seconds: 3600  # 最长持仓秒数；0 表示关闭该安全退出
+  
+  # 风险控制
+  risk:
+    max_loss_per_trade: null  # null 关闭固定金额止损；未知回执保护不受影响
+    max_daily_loss: null  # null 关闭每日金额亏损上限
+    slippage_tolerance: 10  # 每腿滑点风控上限(基点)，默认 0.1%，可由面板修改；不是实际手续费
+    book_utilization_percent: 80  # 开仓使用保护价和收益范围内双边较小深度的比例；100 关闭预留，小额订单不打折
+    entry_extra_profit_bps: 3  # 入场预留：首腿前要求最低净回归空间+预留，首腿成交后允许消耗预留
+    execution_price_movement_bps: 2  # 每腿独立价格变动预算，连同盘口冲击计入入场成本
+    hedge_max_delay_seconds: 5  # 从首腿提交起，到补齐腿允许提交的最长时间
+    route_rollback_limit: 2  # 同平台组合、品种及方向连续回补次数
+    route_rollback_cooldown_seconds: 900  # 暂停该路线新开仓；已有仓位仍允许平仓
+  # 仅用于收益面板预测，不代表最终结算；资金费正值代表多头支付，仅估 Variational 腿、不含 Lighter。
+  cost_model:
+    variational_fee_bps: 0  # Variational 平台成本兜底；官网报价字段优先，手动值仅预测
+    funding_bps_per_8h: 1  # Variational 平台单个 8 小时资金费兜底；未知时可改为 null，可填负值
+  
+  # 交易量优先级
+  volume_priority: true  # 优先考虑交易量而非价差
+  
+  # 刷单参数
+  wash_trading:
+    min_trades_per_day: 20  # 每日最小交易次数
+    max_trades_per_day: 100  # 每日最大交易次数
+    trade_interval_min: 60  # 交易间隔最小时间(秒)
+    trade_interval_max: 300  # 交易间隔最大时间(秒)
+
+# 通用配置
+common:
+  network:
+    proxy_url: null  # 有需要时在页面设置本机代理
+  # 日志配置
+  logging:
+    level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+    file: "logs/trading.log"
+    rotation: "10 MB"
+    retention: "7 days"
+  
+  # 监控配置
+  monitoring:
+    enabled: true
+    check_interval: 30  # 检查间隔(秒)
+  
+  # 数据存储
+  data:
+    save_trades: true
+    data_dir: "data"

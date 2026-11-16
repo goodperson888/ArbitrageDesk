@@ -1,0 +1,100 @@
+# 敏感配置文件
+.env
+.env.*
+!.env.example
+config/config.yaml
+config/*.local.*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 虚拟环境
+venv/
+env/
+ENV/
+.venv
+.venv-*/
+node_modules/
+output/
+.playwright-cli/
+*.har
+*.zip
+*.pem
+*.key
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 日志文件
+logs/
+*.log
+.run/
+
+# 数据文件
+data/
+*.csv
+*.json
+!browser_extension/manifest.json
+!config/variational-execution.example.json
+!tests/**/*.json
+*.db
+
+# 浏览器相关
+.geckodriver/
+chromedriver
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 临时文件
+*.tmp
+*.bak
+*.swp
+*~.nib
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Local editor and browser diagnostics
+.trae/
+.playwright-mcp/

@@ -1,0 +1,41 @@
+{
+  "body_digest": "3508339dd0da7662",
+  "capture_id": "7bd4bd75-5b59-4d4a-9a64-6ad04dc424c6",
+  "complete": false,
+  "endpoint": "/api/transfers",
+  "http_status": 200,
+  "kind": "settlement_response",
+  "method": "GET",
+  "observed_at": "2026-09-27T16:42:40.490114+00:00",
+  "row_count": 3,
+  "rows": [
+    {
+      "asset": "USDC",
+      "company_digest": "4d733cb74091cc84",
+      "id_digest": "3035548c90cec0cd",
+      "qty": 0.000136,
+      "rfq_id_digest": "b750ddffbf553a03",
+      "status": "confirmed",
+      "transfer_type": "realized_pnl"
+    },
+    {
+      "asset": "USDC",
+      "company_digest": "4d733cb74091cc84",
+      "id_digest": "d103e58d795dc69e",
+      "qty": 0.000295,
+      "rfq_id_digest": "c08aa778d85792b9",
+      "status": "confirmed",
+      "transfer_type": "realized_pnl"
+    },
+    {
+      "asset": "USDC",
+      "company_digest": "4d733cb74091cc84",
+      "id_digest": "817ef0173e857c37",
+      "qty": 0.000381,
+      "rfq_id_digest": "244c35cb308a841c",
+      "status": "confirmed",
+      "transfer_type": "realized_pnl"
+    }
+  ],
+  "schema_version": 2
+}

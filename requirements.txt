@@ -1,0 +1,32 @@
+# Browser automation for Variational
+selenium>=4.0.0
+webdriver-manager>=4.0.0
+
+# Public data uses requests. Live trading requires the official lighter-sdk
+# signer plus verified fills; the old HMAC trading implementation is disabled.
+
+# Web framework
+flask>=3.1.3,<3.2
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+httpx>=0.27,<1
+cryptography>=42,<50
+
+# Common libraries
+requests>=2.31.0
+web3>=6.0.0
+python-dotenv>=1.0.0
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Async support
+aiohttp>=3.9.0
+
+# Logging and monitoring
+loguru>=0.7.0
+
+# Time handling
+pytz>=2023.0
+
+# Config management
+pyyaml>=6.0

@@ -1,0 +1,47 @@
+name: Windows portable package
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    env:
+      PYTHONUTF8: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.10'
+          architecture: x64
+      - name: Assemble clean portable source
+        run: python scripts/build_windows.py stage
+      - name: Download official embedded Python
+        shell: pwsh
+        run: |
+          Invoke-WebRequest 'https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip' -OutFile "$env:RUNNER_TEMP/python-embed.zip"
+          Expand-Archive "$env:RUNNER_TEMP/python-embed.zip" dist/ArbitrageDesk/python
+      - name: Install Windows dependencies
+        run: python -m pip install --only-binary=:all: --target dist/ArbitrageDesk/python/Lib/site-packages -r requirements-windows.txt
+      - name: Configure and verify portable runtime offline
+        run: |
+          python scripts/build_windows.py configure
+          dist/ArbitrageDesk/python/python.exe -B scripts/windows_smoke.py --root dist/ArbitrageDesk
+      - name: Verify Windows process locks and lifecycle
+        run: |
+          dist/ArbitrageDesk/python/python.exe -B tests/test_platform_support.py
+          python scripts/build_windows.py archive
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ArbitrageDesk-windows-x64
+          path: dist/ArbitrageDesk-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 14
