@@ -19,8 +19,21 @@ const context=vm.createContext({window:{QuoteFreshness:{describe:()=>({buyLabel:
     setInterval:fn=>timers.push(fn),clearInterval(){},console,Date:class extends Date {static now(){return now;}}});
 vm.runInContext(fs.readFileSync('src/web/static/js/quote_freshness.js','utf8'),context);
 const drawerSource=fs.readFileSync('src/web/static/js/cross_venue.js','utf8').replace(/\}\)\(\);\s*$/,
-    'window.testChannelSpec=drawerChannelSpec;window.testChannelState=drawerChannelState;window.testChannelNote=channelChartNote;window.testRenderChart=renderReversionChart;window.testCloseDrawer=closeDrawer;window.testOpenDrawer=openDrawer;window.testQuoteUpdate=rows=>drawerQuoteUpdate?.(rows.map(refreshReversionEstimate));})();');
+    'window.testQuality=renderReversionQuality;window.testEntryPoint=positionEntryPoint;window.testChannelSpec=drawerChannelSpec;window.testChannelState=drawerChannelState;window.testChannelNote=channelChartNote;window.testRenderChart=renderReversionChart;window.testCloseDrawer=closeDrawer;window.testOpenDrawer=openDrawer;window.testQuoteUpdate=rows=>drawerQuoteUpdate?.(rows.map(refreshReversionEstimate));})();');
 vm.runInContext(drawerSource,context);
+const qualityRoot=new Element();
+context.window.testQuality(qualityRoot,{quality_ready:false,quality_reason:'原始样本不足'});
+assert.match(qualityRoot.text,/原始样本不足/);
+assert.doesNotMatch(qualityRoot.text,/0\.0%/,'unknown evidence must never show a zero return rate');
+context.window.testQuality(qualityRoot,{quality_ready:true,samples:40,sample_span_seconds:1200,
+ center_drift_bps:3,center_bps:20,bounds:{lower_bps:10,upper_bps:30,center_bps:20},target_mode:'center',
+ note:'历史诊断，不代表净盈利',sides:{upper:{entered:4,returned:1,timed_out:1,resolved:2,
+ return_rate:.5,median_return_seconds:120,pending:1,interrupted:1,recent_events:[]},
+ lower:{entered:1,returned:0,timed_out:0,resolved:0,return_rate:null,pending:1,interrupted:0,recent_events:[]}}});
+assert.match(qualityRoot.text,/1 \/ 2/);
+assert.match(qualityRoot.text,/50\.0%/);
+assert.match(qualityRoot.text,/暂无完成观察/);
+assert.match(qualityRoot.text,/历史诊断，不代表净盈利/);
 let chartOptions, chartInits=0;
 const echarts={init:()=>{chartInits++;return {setOption:option=>{chartOptions=option;},getOption:()=>({dataZoom:[{type:'inside',start:25,end:75}]}),dispose(){}};}};
 context.window.echarts=echarts;
@@ -52,6 +65,11 @@ assert.equal(chartInits,beforeInit,'live chart updates reuse the existing EChart
 assert.equal(chartOptions.dataZoom[0].start,25,'live updates preserve chart zoom');
 assert.deepEqual(Array.from(chartOptions.series[0].markLine.data,item=>item.name),['上边界','下边界','通道中心','0']);
 assert.equal(chartOptions.series[0].markLine.data[0].yAxis,200,'use evaluated channel bounds, not seven-day P10/P90');
+assert.match(chartOptions.series[0].markLine.data[0].label.formatter(),/上边界 · A多\/B空 200.00 bps/);
+assert.match(chartOptions.series[0].markLine.data[1].label.formatter(),/下边界 · B多\/A空 -150.00 bps/);
+assert.match(chartRoot._chartOptions.text,/上边界 · A多\/B空/);
+assert.match(chartRoot._chartOptions.text,/下边界 · B多\/A空/);
+assert.match(context.window.testChannelNote(lowerContext),/下沿 B多\/A空：已触边/);
 assert.ok(Math.abs(chartOptions.series[0].data[0][1]-10/1.001)<1e-10,'stored positive ratio spread is converted to execution denominator');
 const frozenSpec=context.window.testChannelSpec(channelRow,{entry_target:{channel,target_bps:512}});
 context.window.StrategyChannelUI={basis:()=>({mode:'fixed',policy:{}})};
@@ -59,6 +77,8 @@ const frozenContext=context.window.testChannelState(channelRow,frozenSpec);
 context.window.testRenderChart(chartRoot,history,{center_bps:999},null,[],512,frozenContext);
 assert.equal(chartOptions.series[0].markLine.data.find(item=>item.name==='本单冻结目标').yAxis,6,'frozen exit uses canonical axis, not directed target');
 assert.equal(chartOptions.series[0].markLine.data.find(item=>item.name==='冻结上界').yAxis,200,'global changes do not move an existing position boundary');
+assert.match(chartOptions.series[0].markLine.data.find(item=>item.name==='冻结上界').label.formatter(),/冻结上界 · A多\/B空/);
+assert.match(chartOptions.series[0].markLine.data.find(item=>item.name==='冻结下界').label.formatter(),/冻结下界 · B多\/A空/);
 context.window.StrategyChannelUI={basis:()=>({mode:'channel',policy})};
 const missingContext=context.window.testChannelState({...channelRow,return_preview:{target_mode:'channel',channel_policy:policy,reason:'通道有效样本不足 3/30'}},channelSpec);
 context.window.testRenderChart(chartRoot,history,{center_bps:999,p10_bps:888},null,[],null,missingContext);
@@ -68,8 +88,75 @@ const staleContext=context.window.testChannelState({...channelRow,buy_age_second
 assert.equal(staleContext.current,null);
 assert.match(context.window.testChannelNote(staleContext),/暂不判断触线/);
 assert.doesNotMatch(context.window.testChannelNote(staleContext),/已触边/);
+assert.equal(staleContext.reverseCurrent,null,'expired quotes cannot retain a reverse live marker');
+const dualRow={...channelRow,buy_venue:'arcus',sell_venue:'lighter',buy_price:100.02,sell_price:100.08,
+    return_inputs:{buy:{ask:100.02,bid:99.98},sell:{ask:100.12,bid:100.08}}};
+const dual=context.window.testChannelState(dualRow,context.window.testChannelSpec(dualRow));
+assert.ok(Math.abs(dual.current-5.995203837)<1e-8);
+assert.ok(Math.abs(dual.reverseCurrent-13.983220136)<1e-8);
+assert.equal(dual.reverseCurrent,-dual.directional.reverse);
+assert.notEqual(dual.reverseCurrent,dual.current,'both bid/ask widths survive the reverse coordinate mapping');
+const dualRoot=new Element(), dualForward=[{timestamp:100,gross_bps:6},{timestamp:101,gross_bps:7},{timestamp:103,gross_bps:8}];
+const dualReverse=[{timestamp:100,gross_bps:-14},{timestamp:101,gross_bps:-15,valid_for_center:false},
+    {timestamp:102,gross_bps:10}];
+const reverseSeries=()=>chartOptions.series.find(s=>s.name==='B买 / A卖 · 反向映射');
+context.window.testRenderChart(dualRoot,dualForward,{}, {timestamp:104,gross_bps:dual.current},[],null,dual,null,dualReverse);
+assert.deepEqual(Array.from(reverseSeries().data.slice(0,2),p=>Array.from(p)),[[100000,14],[101000,null]]);
+assert.ok(Math.abs(reverseSeries().data.find(p=>p[0]===102000)[1]+10/1.001)<1e-10);
+assert.equal(reverseSeries().data.find(p=>p[0]===103000)[1],null,'missing opposite observations are never fabricated from the forward line');
+assert.equal(reverseSeries().lineStyle.type,'dashed','directions remain distinct without relying only on color');
+const dualTip=chartOptions.tooltip.formatter([{seriesIndex:0,value:[104000,dual.current]}]);
+assert.match(dualTip,/A买 \/ B卖：毛价差 6.00 bps · 整轮净差/);
+assert.match(dualTip,/B买 \/ A卖：毛价差 -13.98 bps · 整轮净差/);
+assert.match(dualTip,/双边买卖点差影响 7.99 bps/);
+assert.match(dualTip,/按绿线判断触边/);
+assert.match(dualTip,/上沿 A多\/B空：距边/);
+assert.match(dualTip,/下沿 B多\/A空：距边/);
+assert.match(dualTip,/紫线仅作对照，不判断触边/);
+// F is below the lower boundary, but the reverse mapped quote is zero.
+// The direction label and touch marker must still follow canonical F.
+const touchedRoot=new Element();
+context.window.testRenderChart(touchedRoot,history,{}, {timestamp:104,gross_bps:lowerContext.current},[],null,lowerContext);
+assert.equal(chartOptions.series[0].markPoint.label.formatter,'下沿触边');
+assert.equal(chartOptions.series[0].markPoint.data[0].coord[1],lowerContext.current);
+const lowerTip=chartOptions.tooltip.formatter([{seriesIndex:0,value:[104000,lowerContext.current]}]);
+assert.match(lowerTip,/下沿 B多\/A空：已触边/);
+assert.match(lowerTip,/B买 \/ A卖：毛价差 0.00 bps/);
+assert.match(lowerTip,/整轮收益不足/,'a canonical touch cannot invent a profitable reverse entry');
+context.window.testRenderChart(dualRoot,dualForward,{}, {timestamp:104,gross_bps:dual.current},[],null,dual,null,dualReverse);
+const pastDualTip=chartOptions.tooltip.formatter([{seriesIndex:0,value:[100000,6/1.0006]}]);
+assert.match(pastDualTip,/B买 \/ A卖：毛价差 -14.00 bps/);
+assert.doesNotMatch(pastDualTip,/整轮净差/,'current profits cannot be assigned to historical points');
+const dualRequestCount=quoteRequests.length+otherRequests.length;
+dualRoot._chartInputs.get('reverse').checked=false;dualRoot._chartInputs.get('reverse').listeners.change();
+assert.equal(reverseSeries(),undefined);
+dualRoot._chartInputs.get('reverse').checked=true;dualRoot._chartInputs.get('reverse').listeners.change();
+assert.equal(reverseSeries().data.find(p=>p[0]===100000)[1],14,'visibility redraw retains actual reverse history');
+assert.equal(quoteRequests.length+otherRequests.length,dualRequestCount);
+assert.equal(channel.exit_axis_bps,6,'displaying reverse prices never changes frozen strategy targets');
+const missingOpposite={...dualRow,return_inputs:{buy:{ask:100.02},sell:{bid:100.08}}};
+assert.equal(context.window.testChannelState(missingOpposite,context.window.testChannelSpec(missingOpposite)).reverseCurrent,null);
 context.window.StrategyChannelUI={basis:()=>({mode:'channel',policy:{...policy,window_seconds:900}})};
 assert.equal(context.window.testChannelState(channelRow,channelSpec).channel,null,'changed settings invalidate the old opportunity boundary');
+const touchContext={...frozenContext,channel:{...frozenContext.channel,touch_statistics:{
+    upper:{count:4,low_bps:198,high_bps:201,points:[{timestamp:100,value_bps:200},{timestamp:100.5,value_bps:201}]},
+    lower:{count:3,low_bps:-151,high_bps:-148,points:[{timestamp:101,value_bps:-150}]}}}};
+context.window.testRenderChart(chartRoot,history,{},null,[],512,touchContext);
+assert.equal(chartOptions.series[0].markArea.data.length,2);
+assert.equal(chartOptions.series.filter(s=>s.type==='scatter').length,2,'draw actual independent touch points');
+assert.deepEqual(Array.from(chartOptions.series[0].data,p=>Array.from(p)),
+    [[100000,200],[100500,201],[101000,-150]],
+    'restore omitted touches chronologically, deduplicate timestamps, and preserve their execution axis');
+const touchInput=chartRoot._chartInputs.get('touches');
+touchInput.checked=false;touchInput.listeners.change();
+assert.equal(chartOptions.series[0].markArea.data.length,0);
+assert.equal(chartOptions.series.filter(s=>s.type==='scatter').length,0,'touch controls hide both zones and points');
+assert.ok(chartOptions.series[0].data.some(p=>p[0]===100500 && p[1]===201),
+    'hiding scatter points cannot remove real observations from the price line');
+context.window.testRenderChart(chartRoot,history,{}, {timestamp:100.5,gross_bps:202},[],512,touchContext);
+assert.equal(chartOptions.series[0].data.filter(p=>p[0]===100500).length,1);
+assert.equal(chartOptions.series[0].data.find(p=>p[0]===100500)[1],202,
+    'the latest actual quote takes priority at an identical timestamp');
 // Every overlay can be hidden independently without changing execution data or fetching.
 const controlHistory=[...history,{timestamp:102,gross_bps:80,anomalous:true}];
 const controlCurrent={timestamp:103,gross_bps:30}, controlStats={center_bps:10,p10_bps:9,p90_bps:11,events:[{timestamp:102,start_timestamp:100}]};
@@ -120,6 +207,53 @@ const privateRoot=new Element();blockedStorage.window.testRenderChart(privateRoo
 privateRoot._chartInputs.get('target').checked=false;privateRoot._chartInputs.get('target').listeners.change();
 assert.equal(privateRoot._chartInputs.get('target').checked,false,'blocked browser storage retains usable in-memory controls');
 actions.children[1].listeners.click(); // Restore default drawing choices for the remaining drawer tests.
+// Actual fills have their own point, using the same axis as the displayed chart.
+const chartPosition={open_time:'2026-11-17T01:02:03Z',variational_venue:'arcus',lighter_venue:'lighter',
+    variational_side:'buy',lighter_side:'short',entry_price_variational:100,entry_price_lighter:102,
+    entry_size_variational:1,entry_size_lighter:1};
+assert.equal(context.window.testEntryPoint(chartPosition,null)[1],200,'directed ratio basis for a non-channel holding');
+const forwardEntry=context.window.testEntryPoint(chartPosition,frozenContext);
+assert.equal(forwardEntry[0],Date.parse(chartPosition.open_time));
+assert.equal(forwardEntry[1],2/102*10000,'canonical channel fills use max-price denominator');
+const reversePosition={...chartPosition,variational_side:'short',lighter_side:'buy',entry_price_variational:99,entry_price_lighter:101};
+const reverseEntry=context.window.testEntryPoint(reversePosition,frozenContext);
+assert.equal(reverseEntry[1],2/101*10000,'reverse fills retain A/B order instead of negating directed ratio');
+for(const invalid of [{entry_price_variational:null},{entry_price_lighter:0},{open_time:null},{open_time:'invalid'}]) {
+    assert.equal(context.window.testEntryPoint({...chartPosition,...invalid},frozenContext),null,'missing fills/time never invent an entry point');
+}
+const positionRoot=new Element();
+context.window.testRenderChart(positionRoot,history,{},null,[],512,frozenContext,reversePosition);
+const entrySeries=()=>chartOptions.series.find(s=>s.name==='入场成交点');
+assert.equal(entrySeries().symbol,'diamond');
+assert.deepEqual(Array.from(entrySeries().data[0]),Array.from(reverseEntry));
+assert.match(entrySeries().label.formatter(),/入场 .* bps/);
+assert.match(entrySeries().tooltip.formatter(),/成交均价.*盘口报价/);
+assert.equal(chartOptions.series[0].markLine.data.find(mark=>mark.name==='预计出场').yAxis,6,'exit stays at frozen canonical target');
+assert.equal(chartOptions.series[0].markLine.data.some(mark=>mark.name==='本单冻结目标'),false,'one target line, no duplicate');
+assert.ok(chartOptions.yAxis.min({min:15,max:25})<6,'a target below recent prices is still visible');
+assert.ok(chartOptions.yAxis.max({min:15,max:25})>200,'frozen channel boundaries remain within the position chart');
+assert.ok(!chartOptions.series[0].data.some(p=>p[0]===reverseEntry[0]),'actual fills never become historical BBO observations');
+positionRoot._chartInputs.get('entry').checked=false;positionRoot._chartInputs.get('entry').listeners.change();
+assert.equal(entrySeries(),undefined,'entry marker toggles independently');
+assert.ok(chartOptions.series[0].markLine.data.some(mark=>mark.name==='预计出场'));
+positionRoot._chartInputs.get('entry').checked=true;positionRoot._chartInputs.get('entry').listeners.change();
+assert.ok(entrySeries());
+assert.equal(quoteRequests.length+otherRequests.length,requestCount,'position annotations do not request prices/account data');
+context.window.testRenderChart(positionRoot,[],{},null,[],512,frozenContext,reversePosition);
+assert.ok(entrySeries(),'actual entry can render even when historical quotes are unavailable');
+// A rollback's second price is merely a reference, never a paired fill.
+const rollbackPosition={...reversePosition,entry_size_lighter:0,rollback_category:'edge',entry_target:{
+    frozen_at:'2026-11-17T01:02:02Z',channel:{...channel,entry_axis_bps:-169.31}}};
+assert.equal(context.window.testEntryPoint(rollbackPosition,frozenContext),null);
+context.window.testRenderChart(positionRoot,[],{},null,[],512,frozenContext,rollbackPosition);
+assert.equal(entrySeries(),undefined,'never mix first-leg fills and an unsubmitted second-leg reference');
+const plannedSeries=chartOptions.series.find(s=>s.name==='计划报价点');
+assert.equal(plannedSeries.data[0][1],-169.31,'show the original canonical decision quote, not the apparent reverse fill spread');
+assert.equal(plannedSeries.data[0][0],Date.parse(rollbackPosition.entry_target.frozen_at));
+assert.match(plannedSeries.tooltip.formatter(),/非成交价.*不是首次穿越/);
+assert.ok(chartOptions.series[0].markLine.data.some(mark=>mark.name==='原计划出场'));
+assert.match(positionRoot.text,/本单未成对/);
+assert.equal(quoteRequests.length+otherRequests.length,requestCount);
 delete context.window.StrategyChannelUI;
 delete context.window.echarts;
 const position={id:'original',symbol:'PUMP',status:'open',variational_venue:'lighter',lighter_venue:'arcus',
@@ -150,6 +284,14 @@ const remaining=body.children[0].children.find(item=>item.innerHTML.includes('�
 assert.equal(remaining.bold.textContent,'0 / 0');
 assert.match(body.text,/平台历史成交与已确认回执自动补齐/);
 assert.match(body.text,/暂计 0\.007700 U/);
+context.window.updateOpportunityHistoryPositions([{...recovered,provisional_pnl_usdc:.0065,
+    provisional_fees_usdc:0, gross_price_pnl_usdc:.0065,
+    provisional_accounting_note:'按核验费率 0 bps 暂计；实际账单返回后自动更新'}]);
+assert.match(body.text,/暂计 0\.006500 U/,'rate estimates update the closed drawer');
+assert.doesNotMatch(body.text,/已平仓 · 暂计|已平仓 · 待核账/);
+assert.match(body.text,/已平仓/);
+assert.ok(body.children[0].children.some(item=>item.innerHTML.includes('手续费合计（含暂计）')));
+assert.match(body.text,/按核验费率 0 bps 暂计/);
 context.window.updateOpportunityHistoryPositions([{...recovered,accounting_pending:false,realized_pnl_usdc:.0075}]);
 assert.match(body.text,/0\.007500 U/,'settled accounting refreshes an already closed drawer');
 assert.doesNotMatch(body.text,/暂计 0\.007700 U/);
@@ -230,16 +372,18 @@ assert.match(body.text,/第一腿下单 2，第二腿未提交/);
  context.window.openOpportunityHistoryDrawer({...position,entry_target:{target_bps:-25.84}});
  for(const request of otherRequests.slice(-3))request.resolve({ok:true,json:async()=>request.url.includes('/reversion-stats?')?{center_bps:10}:request.url.includes('/reference-history?')?{points:[]}:history});
  await new Promise(resolve=>setImmediate(resolve));
- assert.equal(chartOptions.series[0].markLine.data.find(item=>item.name==='本单冻结目标').yAxis,-25.84);
+ assert.equal(chartOptions.series[0].markLine.data.find(item=>item.name==='预计出场').yAxis,-25.84);
  // History requests follow the same canonical axis as execution even when
  // this opportunity buys B and sells A.
  vm.runInContext(fs.readFileSync('src/web/static/js/quote_freshness.js','utf8'),context);
  context.window.testOpenDrawer(channelRow);
- const chartRequests=otherRequests.slice(-3);
+ const chartRequests=otherRequests.slice(-4);
+ assert.equal(chartRequests.filter(r=>r.url.includes('/history?')).length,2,'both histories use local stored observations');
  assert.equal(new URL(chartRequests.find(r=>r.url.includes('/history?')).url).searchParams.get('pair'),'arcus->lighter');
  assert.equal(new URL(chartRequests.find(r=>r.url.includes('/reference-history?')).url).searchParams.get('buy_venue'),'arcus');
  context.window.testQuoteUpdate([{...channelRow,_receivedAt:now,_deliverySeconds:0}]);
- for(const request of chartRequests)request.resolve({ok:true,json:async()=>request.url.includes('/reversion-stats?')?{center_bps:999}:request.url.includes('/reference-history?')?{points:[]}:history});
+ const oppositeRequest=chartRequests.find(r=>r.url.includes('/history?')&&new URL(r.url).searchParams.get('pair')==='lighter->arcus');
+ for(const request of chartRequests.filter(r=>r!==oppositeRequest))request.resolve({ok:true,json:async()=>request.url.includes('/reversion-stats?')?{center_bps:999}:request.url.includes('/reference-history?')?{points:[]}:history});
  await new Promise(resolve=>setImmediate(resolve));
  assert.equal(chartOptions.series[0].markLine.data.find(item=>item.name==='下边界').yAxis,-150);
  assert.equal(chartOptions.series[0].markPoint.data[0].coord[1],(99-101)/101*10000);
@@ -250,7 +394,11 @@ assert.match(body.text,/第一腿下单 2，第二腿未提交/);
  assert.match(liveTip,/B买 \/ A卖/);
  const oldTip=chartOptions.tooltip.formatter([{seriesIndex:0,value:[livePoint[0]-1000,livePoint[1]]}]);
  assert.match(oldTip,/历史报价点/);
- assert.doesNotMatch(oldTip,/A买 \/ B卖：/,'current route estimates must not masquerade as historical returns');
+ assert.doesNotMatch(oldTip,/整轮净差/,'current route estimates must not masquerade as historical returns');
+ oppositeRequest.resolve({ok:false,status:503});
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(chartOptions.series[0].markLine.data.find(item=>item.name==='下边界').yAxis,-150,
+     'optional reverse history failure never blocks or removes the main chart');
  const currentChart=body.children.find(item=>item.className==='drawer-reversion-chart');
  assert.match(currentChart.text,/已触边；只读估算/);
  now+=6000;
@@ -259,6 +407,18 @@ assert.match(body.text,/第一腿下单 2，第二腿未提交/);
  assert.match(currentChart.text,/暂不判断触线/);
  for(const request of quoteRequests.slice(-2))request.resolve({ok:true,json:async()=>[{ask:100,bid:99,age_seconds:9,stale:true}]});
  await staleTick;
+ const requestCount=otherRequests.length;
+ assert.equal(otherRequests.some(request=>request.url.includes('/reversion-quality?')),false,
+     'collapsed quality diagnostics must not add background requests to the scanner or drawer');
+ const qualityDetails=body.children.find(item=>item.className==='desk-disclosure drawer-quality');
+ qualityDetails.open=true;qualityDetails.listeners.toggle();
+ assert.equal(otherRequests.length,requestCount+1);
+ const qualityRequest=otherRequests.at(-1);
+ assert.equal(new URL(qualityRequest.url).searchParams.get('pair'),'arcus->lighter',
+     'both upper and lower evidence must use the canonical axis, not a sign-flipped route');
+ qualityRequest.resolve({ok:true,json:async()=>({quality_ready:false,statistics_ready:true,quality_reason:'还没有足够原始样本'})});
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.match(qualityDetails.children[1].text,/还没有足够原始样本/);
  context.window.testCloseDrawer();
  console.log('History drawer recovery, canonical channel bounds, frozen targets, live reuse, races and stale clearing: PASS');
 })().catch(error=>{console.error(error);process.exitCode=1;});

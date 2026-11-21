@@ -7,6 +7,7 @@ from pathlib import Path
 from contextlib import contextmanager
 
 REASONS = frozenset([
+ '反复触碰通道尚未形成有效上下沿，等待独立触碰',
  '通道历史统计正在积累或更新，暂不入场','通道没有有效波动宽度，暂不入场',
  '通道入场方向与回归方向不一致','最新双平台报价已离开通道入场边界',
  '该品种仍有未结束持仓，通道反向需先确认双边结束',
@@ -56,6 +57,9 @@ def rejection_quote(events, rejection):
     return max(batch, key=lambda event: event['detail']['net_edge_bps'], default=None)
 
 SAFE_MARKET_REASONS = frozenset([
+    '行情后台校时中，等待可靠时间源',
+    '行情校时已过期，等待后台校准', '行情接收时间无效，等待新报价',
+    '只读请求等待超时，稍后重试', '账户快照已有读取任务，等待后台重试',
     '持仓报价过期，平仓条件暂无法判断', '持仓盘口无效，平仓条件暂无法判断',
     '持仓账户待核验', '持仓行情待更新，平仓条件暂无法判断',
     '网格平仓估算待补盘口或账务',
@@ -69,6 +73,9 @@ SAFE_MARKET_REASONS = frozenset([
 # them visible in the UI so an account precheck is not confused with a quote
 # failure; raw SDK/browser exception text remains masked below.
 SAFE_EXECUTION_REASONS = frozenset([
+    '当前平台不支持资金预算预检，首腿未提交','资金预留后额度不足，首腿未提交',
+    '账户资金预算依据无效，首腿未提交','已达到最大同时持仓组数，首腿未提交',
+    '资金预算与本次订单不匹配，首腿未提交','资金预算缺少执行身份，首腿未提交',
     '持仓平台组合缺失，必须先核对原仓位',
     '持仓平台组合未匹配，必须先核对原仓位',
     '同品种持仓平台组合不一致，必须先核对原仓位',
@@ -153,10 +160,16 @@ def latest_reference_failure(events):
     return None
 
 def safe_reason(exc):
+    import httpx
     from src.common.rate_limit import RateLimitError, DiscoveryThrottleError
     from src.common.discovery import DiscoveryCooldownError
     if isinstance(exc, (RateLimitError, DiscoveryThrottleError, DiscoveryCooldownError)):
         return str(exc)
+    for error, reason in ((httpx.PoolTimeout, '等待可用连接超时（PoolTimeout）'),
+                          (httpx.ConnectTimeout, '连接平台超时（ConnectTimeout）'),
+                          (httpx.ReadTimeout, '等待平台响应超时（ReadTimeout）')):
+        if isinstance(exc, error):
+            return reason
     message=str(exc)
     tick_error = re.search(r"validation error on field 'price': ([0-9.eE+-]{1,40}) is not a multiple of tick size ([0-9.eE+-]{1,40}) for its price tier", message)
     if tick_error:
@@ -171,7 +184,7 @@ def safe_reason(exc):
                 r'Arcus 当前市场有活动订单：订单号 [A-Za-z0-9._:?\\-]{1,128}，方向 (?:buy|sell|\\?)，数量 [0-9.eE+\\-]{1,40}，只减仓 (?:是|否)',
                 detail):
             return detail
-    if re.fullmatch(r'行情请求失败: (HTTP [0-9]{3}|ReadTimeout|ConnectTimeout|ProxyError|ConnectionError|Timeout|SSLError)',message):
+    if re.fullmatch(r'行情请求失败: (HTTP [0-9]{3}|ReadTimeout|ConnectTimeout|PoolTimeout|ProxyError|ConnectionError|Timeout|SSLError)',message):
         return message
     if message in SAFE_MARKET_REASONS:
         return message

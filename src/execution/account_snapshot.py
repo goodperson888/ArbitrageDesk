@@ -86,7 +86,11 @@ class AccountSnapshotCache:
                 self.invalidate()
 
     def refresh(self, reuse=True):
-        with self.read_lock:
+        if reuse:
+            item = self.get()
+            if item is not None:
+                return item
+        with self._read_guard():
             if reuse:
                 item = self.get()
                 if item is not None:
@@ -116,6 +120,15 @@ class AccountSnapshotCache:
                 self.error = None
                 self.retry_at = 0.0
                 return self.snapshot
+
+    @contextmanager
+    def _read_guard(self):
+        if not self.read_lock.acquire(timeout=2):
+            raise ValueError('账户快照已有读取任务，等待后台重试')
+        try:
+            yield
+        finally:
+            self.read_lock.release()
 
     def start(self):
         if self.thread and self.thread.is_alive():

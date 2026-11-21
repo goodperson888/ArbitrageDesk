@@ -7,7 +7,8 @@ from decimal import Decimal
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 import websocket
-from src.common.market_data import number, utc_now, age_seconds, MarketDataError, normalize_quote_time
+from src.common.market_data import number, utc_now, age_seconds, cached_quote_age, cached_quote_time, MarketDataError, normalize_quote_time
+from src.common.quote_clock import quote_clock
 from src.common.discovery import ArcusSubscriptionError, arcus_subscription_batches, check_arcus_subscription_error
 
 
@@ -66,13 +67,16 @@ class SocketFeed:
     def quote_health(self, symbol):
         with self.lock:
             stamp = self.quote_timestamp(symbol)
-            age = age_seconds(stamp)
+            age = self.quote_age(symbol)
             return {**self.health(), 'quote_updated_at': stamp, 'quote_age_seconds': age,
                     'quote_status': 'fresh' if self.connected and age is not None and 0 <= age <= 2
                     else 'stale' if stamp else 'missing'}
 
     def quote_timestamp(self, symbol):
         return None
+
+    def quote_age(self, symbol):
+        return age_seconds(self.quote_timestamp(symbol))
 
     def health(self):
         with self.lock:
@@ -81,7 +85,7 @@ class SocketFeed:
                     'last_disconnect_at': self.last_disconnect_at,
                     'last_disconnect_reason': self.last_disconnect_reason,
                     'messages': self.message_count, 'timeouts': self.timeout_count,
-                    'reconnects': self.reconnects}
+                    'reconnects': self.reconnects, 'quote_clock': quote_clock.status()}
 
     def _run(self):
         delay = 1
@@ -221,6 +225,10 @@ class ArcusBboFeed(SocketFeed):
     def quote_timestamp(self, symbol):
         return self.quotes.get(symbol, {}).get('updated_at')
 
+    def quote_age(self, symbol):
+        quote = self.quotes.get(symbol, {})
+        return cached_quote_age(age_seconds(quote.get('updated_at')), quote.get('_observed_monotonic'))
+
     def subscribe(self, ws):
         if len(self.markets) * 2 > 100:
             raise ArcusSubscriptionError('Arcus 订阅范围需要拆分到多条行情连接')
@@ -264,9 +272,11 @@ class ArcusBboFeed(SocketFeed):
                 raise ValueError('crossed BBO')
             stamp = contents.get('timestamp')
             received = datetime.now(timezone.utc)
+            received_mono = time.monotonic()
             observed = (datetime.fromtimestamp(float(stamp) / 1e6, timezone.utc)
                         if stamp is not None else received)
-            effective = normalize_quote_time(observed, received)
+            effective = (normalize_quote_time(observed, received, received_monotonic=received_mono)
+                         if stamp is not None else received)
             age = age_seconds(effective.isoformat())
             if age is None or not 0 <= age <= 2:
                 self.quotes.pop(symbol, None)
@@ -276,6 +286,7 @@ class ArcusBboFeed(SocketFeed):
                                    'ask_size': contents['bestAsk'].get('size'),
                                    'exchange_updated_at': observed.isoformat(),
                                    'received_at': received.isoformat(),
+                                   '_observed_monotonic': received_mono-(received-effective).total_seconds(),
                                    'source': 'arcus_websocket'}
             self.unavailable.discard(symbol)
             self._quote_changed(symbol)
@@ -285,8 +296,10 @@ class ArcusBboFeed(SocketFeed):
     def snapshot(self, symbol):
         with self.lock:
             quote = self.quotes.get(symbol)
-            age = age_seconds(quote['updated_at']) if quote else None
-            return dict(quote, funding=self.funding.get(symbol)) if self.connected and age is not None and 0 <= age <= 2 else None
+            age = self.quote_age(symbol) if quote else None
+            return dict({k:v for k,v in quote.items() if not k.startswith('_')},
+                        updated_at=cached_quote_time(quote['updated_at'],quote.get('_observed_monotonic')),
+                        funding=self.funding.get(symbol)) if self.connected and age is not None and 0 <= age <= 2 else None
 
 
 class ArcusFeedGroup:
@@ -357,6 +370,9 @@ class LighterBookFeed(SocketFeed):
             return min(observed, received)
         return received
 
+    def quote_age(self, symbol):
+        return cached_quote_age(age_seconds(self.quote_timestamp(symbol)), self.books.get(symbol, {}).get('_observed_monotonic'))
+
     def discovery_issue(self, symbol):
         with self.lock:
             book = self.books.get(symbol)
@@ -389,8 +405,10 @@ class LighterBookFeed(SocketFeed):
             rows = [data] if 'market_id' in data else list(data.values())
             now = time.time()
             try:
-                observed = float(message['timestamp'])/1000
-            except (KeyError, ValueError, TypeError):
+                observed_at = datetime.fromtimestamp(number(message['timestamp'], True)/1000, timezone.utc)
+                received = datetime.now(timezone.utc)
+                observed = normalize_quote_time(observed_at, received, received_monotonic=time.monotonic()).timestamp()
+            except (KeyError, ValueError, TypeError, OverflowError, OSError, MarketDataError):
                 return
             if not 0 <= now-observed <= 120:
                 return
@@ -434,15 +452,19 @@ class LighterBookFeed(SocketFeed):
             if begin != book['nonce'] or nonce <= book['nonce']:
                 raise ValueError('orderbook sequence gap')
         received = datetime.now(timezone.utc)
+        received_mono = time.monotonic()
         exchange_at = book.get('exchange_at')
         effective_at = book.get('updated_at') if exchange_at else received.isoformat()
+        observed_mono = book.get('_observed_monotonic') if exchange_at else received_mono
         time_basis = 'exchange_last_observed' if exchange_at else 'receipt_only'
         if 'timestamp' in message:
             # Native stream timestamps are milliseconds. Receipt time alone
             # must not make a delayed exchange frame look new.
             try:
                 observed = datetime.fromtimestamp(number(message['timestamp'], True) / 1000, timezone.utc)
-                effective_at = normalize_quote_time(observed, received).isoformat()
+                effective = normalize_quote_time(observed, received, received_monotonic=received_mono)
+                effective_at = effective.isoformat()
+                observed_mono = received_mono-(received-effective).total_seconds()
             except (ValueError, OverflowError, OSError, MarketDataError) as exc:
                 raise ValueError('invalid orderbook timestamp') from exc
             exchange_at = observed.isoformat()
@@ -464,7 +486,8 @@ class LighterBookFeed(SocketFeed):
         if book['bids'] and book['asks'] and max(book['bids']) > min(book['asks']):
             raise ValueError('crossed orderbook')
         book.update(offset=offset, nonce=nonce, received_at=received.isoformat(),
-                    exchange_at=exchange_at, updated_at=effective_at, time_basis=time_basis)
+                    exchange_at=exchange_at, updated_at=effective_at, time_basis=time_basis,
+                    _observed_monotonic=observed_mono)
         self.books[symbol] = book
         self._quote_changed(symbol)
 
@@ -473,8 +496,8 @@ class LighterBookFeed(SocketFeed):
             b = self.books.get(symbol)
             if not self.connected or not b:
                 return None
-            stamp = self.quote_timestamp(symbol)
-            age = age_seconds(stamp)
+            stamp = cached_quote_time(self.quote_timestamp(symbol), b.get('_observed_monotonic'))
+            age = self.quote_age(symbol)
             if age is None or not 0 <= age <= 10:
                 return None
             result = {'symbol': symbol, 'market_id': self.markets[symbol], 'source': 'lighter_websocket',

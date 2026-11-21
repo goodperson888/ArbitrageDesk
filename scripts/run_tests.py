@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 TESTS = ROOT / 'tests'
@@ -26,7 +27,7 @@ SCOPES = {
                  'test_entry_cost_and_once.py', 'test_entry_window_risk.py',
                  'test_opportunity*.py', 'test_reversion_recency.py',
                  'test_center_statistics.py', 'test_round_trip_preview.py'),
-    'market': ('test_market*.py', 'test_live_feeds.py', 'test_quote_stream_freshness.py',
+    'market': ('test_market*.py', 'test_live_feeds.py', 'test_quote_clock.py', 'test_quote_stream_freshness.py',
                'test_*discovery*.py', 'test_catalog*.py', 'test_arcus_adapter.py',
                'test_arcus_pricing.py', 'test_arcus_quote_clock.py',
                'test_arcus_subscription_limits.py', 'test_passive_bridge.py',
@@ -89,7 +90,11 @@ def run_python(files):
         imports.append({'file': path.name, 'seconds': time.perf_counter() - started})
     if not suite.countTestCases():
         raise ValueError('选中的后端文件没有测试用例，不能视为验证通过')
-    result = unittest.TextTestRunner(verbosity=1, resultclass=TimedResult).run(suite)
+    # Service/CLI tests may exercise real startup hooks. An offline regression
+    # must never calibrate mock exchange timestamps against live NTP servers.
+    # Clock tests inject their own independent QuoteClock instances instead.
+    with patch('src.common.quote_clock.quote_clock.start'):
+        result = unittest.TextTestRunner(verbosity=1, resultclass=TimedResult).run(suite)
     return {'passed': result.wasSuccessful(), 'count': result.testsRun,
             'failures': len(result.failures), 'errors': len(result.errors),
             'skipped': len(result.skipped), 'imports': imports,

@@ -8,6 +8,8 @@ import threading
 import time
 from concurrent.futures import Future, wait
 
+import httpx
+
 from src.common.market_data import age_seconds, utc_now
 from src.execution.telemetry import safe_reason
 
@@ -26,6 +28,8 @@ class PositionMonitor:
             for trader in pair:
                 self.venue_traders[trader.venue] = trader
         self.jobs, self.values, self.errors, self.next_read = {}, {}, {}, {}
+        self.job_started, self.expired_jobs, self.read_failures = {}, {}, {}
+        self.error_since = {}
         self.generations, self.checks, self.positions = {}, {}, []
         self.exit_stream_reads = {}
         from src.execution.close_accounting import ClosedFundingReads
@@ -76,7 +80,10 @@ class PositionMonitor:
     def _submit(self, key, generation, reader):
         kind = key[0]
         limit = {'quote': 4, 'account': 4, 'grid': 2, 'entry': 1}[kind]
-        if key in self.jobs or sum(k[0] == kind for k in self.jobs) >= limit:
+        outstanding = [k for f,k in self.expired_jobs.items() if not f.done()]
+        if (key in self.jobs or key in outstanding or
+                sum(k[0] == kind for k in self.jobs) +
+                sum(k[0] == kind for k in outstanding) >= limit):
             return
         future = Future()
         # These threads perform GETs only and never mutate strategy/account
@@ -87,14 +94,27 @@ class PositionMonitor:
             except Exception as exc:
                 future.set_exception(exc)
         self.jobs[key] = (future, generation)
+        self.job_started[key] = time.monotonic()
         threading.Thread(target=read, daemon=True, name='position-' + kind).start()
         return True
 
     def _collect(self):
+        self.expired_jobs = {f:k for f,k in self.expired_jobs.items() if not f.done()}
+        now = time.monotonic()
         for key, (future, generation) in list(self.jobs.items()):
             if not future.done():
+                started = self.job_started.get(key, now)
+                if now-started > 8:
+                    del self.jobs[key]
+                    self.job_started.pop(key, None)
+                    self.expired_jobs[future] = key
+                    self.errors[key] = ('持仓账户读取超时，等待后台重试' if key[0]=='account'
+                                        else '持仓只读任务超时，等待后台重试')
+                    self.error_since.setdefault(key, now)
+                    self.next_read[key] = now+{'quote':.5,'account':5,'grid':1,'entry':5}[key[0]]
                 continue
             del self.jobs[key]
+            self.job_started.pop(key, None)
             if generation != self.generations.get(key[1]):
                 continue
             kind = key[0]
@@ -107,7 +127,7 @@ class PositionMonitor:
                     if position is not None and apply_entry_evidence(position, value):
                         self.strategy._save()
                         self.generations[key[1]] = self._generation(
-                            [p for p in self.positions if p.symbol == key[1] and p.status == 'open'])
+                            [p for p in self.positions if p.symbol == key[1] and self._readable(p)])
                     self.errors.pop(key, None)
                     continue
                 if kind == 'quote':
@@ -131,8 +151,24 @@ class PositionMonitor:
                         self.next_read[key] = time.monotonic() + min(1, max(.25, min(remaining) - .5))
                 self.values[key] = (value, time.monotonic(), generation)
                 self.errors.pop(key, None)
+                self.read_failures.pop(key, None)
+                self.error_since.pop(key, None)
             except Exception as exc:
                 self.errors[key] = safe_reason(exc)
+                self.error_since.setdefault(key, now)
+                failures = min(4, self.read_failures.get(key, 0)+1)
+                self.read_failures[key] = failures
+                # Account recovery backs off; normal quote/exit retries keep
+                # their existing cadence so a transient stale quote cannot
+                # add seconds to a profitable close. Exchange 429s still win.
+                delay = (min(30, 5*2**(failures-1)) if kind=='account' else
+                         {'quote':.5,'grid':1,'entry':5}[kind])
+                # PoolTimeout sends no request to the venue. Recover locally
+                # without a 30s network-error backoff; real 429 cooldowns win.
+                if kind == 'account' and isinstance(exc, httpx.PoolTimeout):
+                    delay = min(5, 2**(failures-1))
+                self.next_read[key] = time.monotonic()+max(
+                    delay,float(getattr(exc,'retry_after_seconds',0)))
 
     @staticmethod
     def _validate_quote(value):
@@ -169,6 +205,10 @@ class PositionMonitor:
                 return None
         return tuple(revision)
 
+    def _readable(self, position):
+        return position.status == 'open' or (bool(self.strategy.halted_reason) and
+                                             position.status == 'reconcile_required')
+
     def poll(self, positions, *, wait_for_reads=True):
         if self.closed:
             return
@@ -176,7 +216,7 @@ class PositionMonitor:
         self.positions = [p for p in positions if p.status != 'closed']
         groups = {}
         for p in self.positions:
-            if p.status == 'open':
+            if self._readable(p):
                 groups.setdefault(p.symbol, []).append(p)
         self.generations = {s: self._generation(rows) for s, rows in groups.items()}
         self._collect()
@@ -197,6 +237,8 @@ class PositionMonitor:
                 continue
             for leg, trader in traders.items():
                 for kind, method in (('quote', 'get_position_mark_snapshot'), ('account', 'position_snapshot')):
+                    if kind == 'account' and callable(getattr(type(trader), 'monitor_position_snapshot', None)):
+                        method = 'monitor_position_snapshot'
                     key = (kind, symbol, leg)
                     if kind == 'quote' and callable(getattr(type(trader),'cached_reference_quote',None)):
                         try:
@@ -214,6 +256,8 @@ class PositionMonitor:
                         if now >= self.next_read.get(key, 0) or cached and cached[2] != generation:
                             self._submit(key, generation, lambda t=trader, s=symbol, m=method: getattr(t, m)(s))
             for p in group:
+                if p.status != 'open':
+                    continue  # Pending orders receive quote/account reads only.
                 entry_key = ('entry', symbol, p.id)
                 if now >= self.next_read.get(entry_key, 0):
                     from src.execution.entry_accounting import read_entry_evidence
@@ -271,7 +315,26 @@ class PositionMonitor:
             key = ('account', symbol, leg)
             self.values.pop(key, None)
             self.errors.pop(key, None)
+            self.error_since.pop(key, None)
             self.next_read[key] = 0
+
+    def _account_health(self, symbol, leg):
+        key = ('account', symbol, leg)
+        cached = self.values.get(key)
+        observed_at = cached[0].get('fetched_at') if cached and cached[2] == self.generations.get(symbol) else None
+        age = age_seconds(observed_at)
+        try:
+            self._value(key, 8)
+            ready = age is not None and 0 <= age <= 8
+        except PositionReadUnavailable:
+            ready = False
+        return {'status': 'ready' if ready else 'pending',
+                'error': self.errors.get(key), 'last_success_at': observed_at,
+                'age_seconds': age,
+                'blocked_for_seconds': round(max(0, time.monotonic()-self.error_since[key]), 1)
+                    if key in self.error_since else None,
+                'reading': key in self.jobs,
+                'retry_in_seconds': round(max(0, self.next_read.get(key, 0)-time.monotonic()), 1)}
 
     def grid_estimate(self, position):
         value = self._value(('grid', position.symbol, position.id), 2)
@@ -309,18 +372,24 @@ class PositionMonitor:
 
     @property
     def entry_blocked(self):
+        return self.entry_block_reason is not None
+
+    @property
+    def entry_block_reason(self):
+        if self.strategy.halted_reason:
+            return self.strategy.halted_reason
         for p in self.positions:
             if p.status == 'closed':
                 continue
             try:
                 self.accounts(p.symbol)
             except PositionReadUnavailable:
-                return True
+                return p.symbol+' 账户核验受阻，暂停新开仓；后台重试中'
             check = self.checks.get(p.id, {})
             age = age_seconds(check.get('last_success_at') or p.open_time.astimezone().isoformat())
             if age is None or age > 10:
-                return True
-        return False
+                return p.symbol+' 持仓监控待核验，暂停新开仓；后台重试中'
+        return None
 
     def publish(self):
         try:
@@ -358,17 +427,21 @@ class PositionMonitor:
                 row['legs'][leg] = {'venue': trader.venue, 'source': quote.get('source'),
                     'bid': quote.get('bid'), 'ask': quote.get('ask'), 'fee_bps': quote.get('fee_bps'),
                     'updated_at': quote.get('updated_at'), 'age_seconds': age_seconds(quote.get('updated_at')),
-                    'error': self.errors.get(key), 'connection': health}
+                    'error': self.errors.get(key), 'connection': health,
+                    'account': self._account_health(p.symbol, leg)}
             try:
                 self.accounts(p.symbol)
                 row['account_status'] = 'ready'
             except PositionReadUnavailable:
                 row['account_status'] = 'pending'
-                row['account_errors'] = [self.errors[key] for key in
-                    [('account', p.symbol, leg) for leg in self.traders] if key in self.errors]
+                names = {'lighter': 'Lighter 主网', 'lighter_rh': 'Lighter RH', 'arcus': 'Arcus'}
+                row['account_errors'] = [names.get(item['venue'], item['venue'])+'：'+item['account']['error']
+                    for item in row['legs'].values() if item['account']['error']]
             row['status'] = ('blocked' if row.get('error') else 'waiting_account'
                              if row['account_status'] != 'ready' else 'monitoring')
             row['position_status'] = p.status
+            if self.strategy.halted_reason:
+                row.update(status='blocked', error=self.strategy.halted_reason)
             if not p.grid_cycle_id and p.status == 'open' and (self.strategy.close_mode != 'disabled' or (p.entry_target or {}).get('channel')):
                 try:
                     estimate = self.strategy._single_profit_estimate(p)
@@ -388,11 +461,14 @@ class PositionMonitor:
             rows.append(row)
         payload = {'worker_pid': os.getpid(), 'started_at': self.started_at, 'updated_at': utc_now(),
                    'running': not self.closed, 'entry_paused': self.entry_blocked, 'positions': rows,
+                   'entry_pause_reason': self.entry_block_reason,
+                   'read_tasks': {'active':len(self.jobs),'timed_out_pending':len(self.expired_jobs)},
                    'stop_reason': self.strategy.halted_reason,
+                   'read_only': bool(self.strategy.halted_reason),
                    'profit_exit_guard_version': 3, 'entry_scan_pipeline_version': 10,
                    'entry_profit_model_version': 2 if self.strategy.target_return_enabled else 1,
                    'entry_budget_policy_version': 2,
-                   'channel_policy_version': 1, 'execution_latency_version': 2,
+                   'channel_policy_version': 2, 'execution_latency_version': 2,
                    'manual_close_version': getattr(self.strategy, 'manual_close_version', 0),
                    'entry_limits': self.strategy.entry_limits_status(),
                    'entry_scan': self.strategy.entry_scan_status()}

@@ -84,6 +84,7 @@ class EntryPrecheckMixin:
 
     def release_entry_precheck(self):
         self.invalidate_entry_precheck()
+        self._entry_capital_policy = None
         cache = getattr(self, '_account_snapshot_cache', None)
         if cache is not None:
             cache.release(TradeHistory.current_execution_id())
@@ -107,16 +108,37 @@ class EntryPrecheckMixin:
     def invalidate_entry_precheck(self):
         self._entry_precheck = None
 
+    def entry_capital_balance(self, balance, symbol, side):
+        """Reapply the same attempt's budget when fresh account checks run.
+
+        An expired submission proof may fall back to validate_order; that
+        path must not silently spend the reserved portion of the account.
+        """
+        evidence = getattr(self, '_entry_capital_policy', None)
+        if evidence is None or evidence[0] != TradeHistory.current_execution_id():
+            return Decimal(str(balance))
+        normalized = 'buy' if side in ('buy','long') else 'sell'
+        if symbol != evidence[1] or normalized != evidence[2]:
+            raise ValueError('资金预算与本次订单不匹配，首腿未提交')
+        from .capital_budget import available_entry_budget
+        return available_entry_budget(balance, evidence[3])
+
     def precheck_order(self, symbol, quantity, side, *, allow_resize=False,
-                       reference_price=None, quantity_step=None, cost_bps=0):
+                       reference_price=None, quantity_step=None, cost_bps=0, capital_policy=None):
         with self.lock:
             self.invalidate_entry_precheck()
             execution_id = TradeHistory.current_execution_id()
+            self._entry_capital_policy = ((execution_id, symbol, 'buy' if side in ('buy','long') else 'sell',
+                                          dict(capital_policy)) if capital_policy is not None else None)
+            if capital_policy is not None and not execution_id:
+                raise ValueError('资金预算缺少执行身份，首腿未提交')
             cache = getattr(self, '_account_snapshot_cache', None)
             snapshot = cache.refresh() if cache is not None else None
             state = snapshot[0] if snapshot is not None else None
             checked_at, token = (snapshot[1:] if snapshot is not None else (time.monotonic(), None))
             balance_reader = getattr(type(self), 'entry_available_balance', None)
+            if capital_policy is not None and (not allow_resize or not callable(balance_reader)):
+                raise ValueError('当前平台不支持资金预算预检，首腿未提交')
             if allow_resize and callable(balance_reader):
                 if state is None:
                     state = self.read_entry_account_state()
@@ -126,11 +148,14 @@ class EntryPrecheckMixin:
                 if (not balance.is_finite() or balance < 0 or not price.is_finite() or price <= 0 or
                         not step.is_finite() or step <= 0 or not costs.is_finite() or costs < 0):
                     raise ValueError('账户缩量依据无效，首腿未提交')
+                if capital_policy is not None:
+                    balance = self.entry_capital_balance(balance, symbol, side)
                 affordable = balance / (price * (1 + costs / 10000))
                 quantity = min(Decimal(str(quantity)),
                                (affordable / step).to_integral_value(rounding=ROUND_DOWN) * step)
                 if quantity <= 0:
-                    raise ValueError('可用保证金不足，缩量后低于数量精度，首腿未提交')
+                    raise ValueError('资金预留后额度不足，首腿未提交' if capital_policy is not None else
+                                     '可用保证金不足，缩量后低于数量精度，首腿未提交')
             if state is not None:
                 evidence = self.validate_order(symbol, quantity, side=side, account_state=state)
             else:
@@ -138,7 +163,7 @@ class EntryPrecheckMixin:
             if snapshot is not None:
                 cache.reserve(execution_id, token)
             if execution_id and isinstance(evidence, dict):
-                balance = Decimal(str(evidence.get('available_balance')))
+                balance = self.entry_capital_balance(evidence.get('available_balance'), symbol, side)
                 if balance.is_finite() and balance >= 0:
                     self._entry_precheck = (execution_id, symbol, Decimal(str(quantity)),
                                             side, balance, checked_at,

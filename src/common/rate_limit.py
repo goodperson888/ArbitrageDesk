@@ -50,6 +50,30 @@ class RateLimitGate:
         if remaining > 0:
             raise RateLimitError(remaining)
 
+    def optional_read_ready(self):
+        """Yield accounting to reserved candidates and recent real throttles.
+
+        Normal reference scanning must not starve a ten-minute accounting
+        probe forever. This read never reserves or delays a discovery slot.
+        """
+        now, state = time.time(), self._read()
+        if now < float(state.get('until', 0)) or (state.get('failures') and
+                now < float(state.get('until', 0)) + 60):
+            return False
+        try:
+            pacing = json.loads(self.path.with_suffix('.discovery.json').read_text())
+            return now >= float(pacing.get('priority_until', 0))
+        except (OSError, ValueError, TypeError):
+            return True
+
+    def _recovery_interval(self, interval, now):
+        # Only optional reference probes slow down after a real rejection.
+        # Required reads and candidate preparation retain their normal path.
+        state = self._read()
+        if now < float(state.get('until', 0)) + 60 and state.get('failures'):
+            return max(interval, min(16, interval * 2 ** min(3, int(state['failures']))))
+        return interval
+
     def discovery_delay(self, interval=2, priority=False):
         """Queue readiness without spending a slot or raising local throttles.
 
@@ -69,11 +93,13 @@ class RateLimitGate:
                 pacing = json.loads(pacing_path.read_text())
                 until = float(pacing.get('until', 0))
                 priority_until = float(pacing.get('priority_until', 0))
+                background_until = float(pacing.get('background_until', 0))
             except (OSError, ValueError, TypeError):
-                until = priority_until = 0
+                until = priority_until = background_until = 0
             if priority and until > now and priority_until < until + interval:
-                self._write_discovery(pacing_path, dict(until=until, priority_until=until+interval))
-            return max(0.0, (until if priority else max(until, priority_until)) - now)
+                self._write_discovery(pacing_path, dict(until=until, priority_until=until+interval,
+                                                       background_until=background_until))
+            return max(0.0, (until if priority else max(until, priority_until, background_until)) - now)
 
     def reserve_discovery(self, interval=2, priority=False):
         """Bound optional REST book discovery across local processes.
@@ -93,18 +119,23 @@ class RateLimitGate:
                 pacing = json.loads(pacing_path.read_text())
                 until = float(pacing.get('until', 0))
                 priority_until = float(pacing.get('priority_until', 0))
+                background_until = float(pacing.get('background_until', 0))
             except (OSError, ValueError, TypeError):
-                until = priority_until = 0
-            blocked_until = until if priority else max(until, priority_until)
+                until = priority_until = background_until = 0
+            blocked_until = until if priority else max(until, priority_until, background_until)
             if blocked_until > now:
                 if priority and until > now and priority_until < until + interval:
                     # One bounded reservation tied to the LAST admitted read.
                     # Repeated failures cannot push an abandoned ticket out
                     # forever; another process can use the slot after expiry.
-                    self._write_discovery(pacing_path, dict(until=until, priority_until=until+interval))
+                    self._write_discovery(pacing_path, dict(until=until, priority_until=until+interval,
+                                                           background_until=background_until))
                 raise DiscoveryThrottleError(blocked_until - now)
             # Consuming the slot also clears the priority reservation.
-            self._write_discovery(pacing_path, {'until': now + interval})
+            self._write_discovery(pacing_path, {
+                'until': now + interval,
+                'background_until': max(background_until, now + self._recovery_interval(interval, now)),
+            })
 
     def _write_discovery(self, path, payload):
         fd, temporary = tempfile.mkstemp(dir=self.path.parent, prefix='.discovery-')
@@ -134,7 +165,13 @@ class RateLimitGate:
         with self.lock, self.path.with_suffix('.lock').open('a') as lockfile:
             fcntl.flock(lockfile, fcntl.LOCK_EX)
             old = self._read()
-            failures = min(6, int(old.get('failures', 0)) + 1) if now - old.get('last', 0) < 600 else 1
+            # In-flight requests can all return 429 after the first one has
+            # closed the gate. Count that burst once, rather than jumping to
+            # a two-minute backoff from several replies to the same burst.
+            if float(old.get('until', 0)) > now:
+                failures = max(1, int(old.get('failures', 1)))
+            else:
+                failures = min(6, int(old.get('failures', 0)) + 1) if now - old.get('last', 0) < 600 else 1
             delay = max(1, delay, min(120, 5 * 2 ** (failures - 1)) + random.uniform(0, 1))
             until = max(now + delay, float(old.get('until', 0)))
             fd, temporary = tempfile.mkstemp(dir=self.path.parent, prefix='.cooldown-')

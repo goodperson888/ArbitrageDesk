@@ -54,7 +54,15 @@ def pair_runtime_blockers(profile, *, recover_at_start=False):
         pair_state = _json.loads(pair_state_path.read_text())
         open_positions = [item for item in pair_state.get('positions', [])
                           if item.get('status') != 'closed']
-        resume_verified = resume_proof_valid(pair_state, venues)
+        # The dashboard can check the whole three-venue scope. Its proof
+        # covers the portfolio, while each held position still has two legs.
+        # Validate using a persisted held pair, never treat all scan venues
+        # as the legs of one position.
+        proof_venues = venues
+        if len(venues) > 2 and open_positions and (pair_state.get('resume_proof') or {}).get('portfolio') is True:
+            held = open_positions[0]
+            proof_venues = [held.get('variational_venue'), held.get('lighter_venue')]
+        resume_verified = resume_proof_valid(pair_state, proof_venues)
         if (pair_state.get('halted_reason') or open_positions) and not resume_verified and not recover_at_start:
             reason = pair_state.get('halted_reason') or '存在未完成持仓'
             blockers.append('该平台组合有未核对成交/持仓：' + str(reason))
@@ -218,11 +226,11 @@ def run_runtime(config_path, profile_path, once=False, wait_once=False, max_noti
         reversion_min_samples = int(reversion_min_samples or 0)
     except (TypeError, ValueError):
         raise ValueError('历史回归筛选无效')
-    if (not 300 <= reversion_window_seconds <= 604800 or reversion_min_count < 0 or
+    if (not 300 <= reversion_window_seconds <= 7776000 or reversion_min_count < 0 or
             not math.isfinite(reversion_min_deviation_bps) or reversion_min_deviation_bps < 0 or
             not math.isfinite(reversion_max_age_seconds) or reversion_max_age_seconds < 0 or
             reversion_min_samples < 0):
-        raise ValueError('历史回归筛选必须为非负数，窗口应在 5 分钟至 7 天')
+        raise ValueError('历史回归筛选必须为非负数，窗口应在 5 分钟至 90 天')
     if target_notional and max_notional is not None and target_notional + 1e-9 < float(max_notional):
         raise ValueError('目标累计金额不能小于每腿上限')
     if not isinstance(close_only, bool):

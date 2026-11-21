@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from src.api_v2.history import MultiVenueHistory, HISTORY_RETENTION_SECONDS
+from src.api_v2.history import MultiVenueHistory, HISTORY_RETENTION_SECONDS, ROLLUP_5M_SECONDS
 from src.common.history import HistoryStore
 from src.execution.history import TradeHistory
 from src.web.rollback_explanation import attach_rollback_explanations
@@ -51,10 +51,10 @@ class HistoryQueryPerformanceTests(unittest.TestCase):
         def row(symbol,stamp):
             return (symbol,stamp,'lighter->arcus','lighter','arcus',10,0,0,0,None)
         with patch('src.api_v2.history.time.monotonic',return_value=100):
-            store._insert([row('old',now-HISTORY_RETENTION_SECONDS-1),row('current',now)],now)
+            store._insert([row('old',now-HISTORY_RETENTION_SECONDS-301),row('current',now)],now)
         with store._connect() as db:
             self.assertEqual(db.execute('SELECT symbol FROM observations').fetchall(),[('current',)])
-            db.execute('INSERT INTO observations VALUES(?,?,?,?,?,?,?,?,?,?)',row('expired',now-HISTORY_RETENTION_SECONDS-1))
+            db.execute('INSERT INTO observations VALUES(?,?,?,?,?,?,?,?,?,?)',row('expired',now-HISTORY_RETENTION_SECONDS-301))
         with patch('src.api_v2.history.time.monotonic',return_value=101):
             store._insert([row('new',now)],now)
         with store._connect() as db:
@@ -69,3 +69,26 @@ class HistoryQueryPerformanceTests(unittest.TestCase):
         with charts._connect() as db:
             self.assertIn('idx_observations_ts',str(db.execute(
                 'EXPLAIN QUERY PLAN DELETE FROM observations WHERE ts < ?',(now,)).fetchall()))
+
+    def test_long_window_rollups_are_idempotent_and_survive_raw_retention(self):
+        store = MultiVenueHistory(self.root/'long.sqlite')
+        now = 10_000_000
+        def row(stamp, value):
+            return ('SUI-PERP', stamp, 'lighter->arcus', 'lighter', 'arcus', value, 0, 0, 1, None)
+        old = now - 10 * 86400
+        with patch('src.api_v2.history.time.monotonic', return_value=100):
+            store._insert([row(old, 10), row(old + 30, 20)], now)
+        # Replacing an observation with the same primary key must rebuild the
+        # bucket rather than incrementing it a second time.
+        with patch('src.api_v2.history.time.monotonic', return_value=101):
+            store._insert([row(old, 10)], now)
+        with store._connect() as db:
+            count, total = db.execute(
+                'SELECT sample_count, sum_bps FROM observation_rollups '
+                'WHERE symbol=? AND bucket_seconds=?', ('SUI-PERP', ROLLUP_5M_SECONDS)).fetchone()
+            self.assertEqual((count, total), (2, 30))
+        with patch('src.api_v2.history.time.time', return_value=now):
+            rows = store.read('SUI-PERP', 30 * 86400, 'lighter->arcus')
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]['aggregate'])
+        self.assertEqual(rows[0]['sample_count'], 2)

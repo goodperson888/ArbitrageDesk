@@ -6,6 +6,7 @@ from datetime import datetime
 
 from src.execution.grid_policy import GridPolicy, layer_funding
 from src.execution.orders import fresh_quote
+from src.execution.exit_limits import allocate_close_movement
 from src.common.market_data import utc_now
 from src.strategy.position_routes import for_position
 
@@ -155,7 +156,11 @@ class SpreadGridMixin:
             price = float(quote['bid' if is_long else 'ask']) * (1 + (-1 if is_long else 1) * (impact + movement) / 10000)
             legs[leg] = {'quote': dict(quote), 'side': 'sell' if is_long else 'buy',
                          'reference_price': float(quote['bid' if is_long else 'ask']),
-                         'slippage_bps': impact + movement, 'bound': price}
+                         'slippage_bps': impact + movement, 'bound': price,
+                         'fee_bps': fee, 'movement_bps': movement, 'impact_bps': impact,
+                         'liquidity_weight': self.close_liquidity.weight(
+                             self._venue_name(trader, leg), position.symbol,
+                             'sell' if is_long else 'buy', quote, qty)}
             pnl += (price - getattr(position, 'entry_price_' + leg)) * qty * (1 if is_long else -1)
             pnl -= price * qty * fee / 10000
             ref_price = legs[leg]['reference_price']
@@ -176,6 +181,15 @@ class SpreadGridMixin:
             elif getattr(trader, 'venue', None) != 'arcus':
                 return None
             funding_total += funding
+        original = {name: leg['bound'] for name, leg in legs.items()}
+        allocate_close_movement(legs, self.slippage_tolerance)
+        for name, leg in legs.items():
+            delta = leg['bound'] - original[name]
+            qty = getattr(position, name + '_size')
+            fee_delta = delta * qty * leg['fee_bps'] / 10000
+            pnl += delta * qty * (1 if leg['side'] == 'sell' else -1) - fee_delta
+            closing_fee += fee_delta
+            closing_notional += delta * qty
         pnl += funding_total
         reference_pnl += funding_total
         if not math.isfinite(pnl):

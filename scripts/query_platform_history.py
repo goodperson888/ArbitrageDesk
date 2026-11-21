@@ -2,9 +2,7 @@
 """Fetch fill evidence for history display. This script never submits orders."""
 import argparse
 import json
-import os
 import sys
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,7 +13,7 @@ from dotenv import dotenv_values
 from src.common.config_loader import ConfigLoader
 from src.execution.history_recovery import normalized_order, recover_leg, timestamp
 from src.execution.history_accounting import (arcus_pages, enrich_arcus_orders, enrich_lighter_order,
-                                               journal_fees, epoch_ms, funding_record, merge_evidence)
+                                               journal_fees, epoch_ms, funding_record, store_evidence)
 from src.execution.history import TradeHistory
 from src.web.execution_book import pair_sources
 from src.execution.platform_clients import LighterCredentials, build_lighter_session
@@ -156,23 +154,7 @@ def main():
                 except Exception:
                     pass
     journal_fees(ROOT / 'data/execution_orders.sqlite', rows)
-    cache_path = ROOT / 'data/platform-order-history.json'
-    try:
-        previous = json.loads(cache_path.read_text())
-    except (OSError, ValueError):
-        previous = {}
-    cache = {'orders_submitted': False, 'checked_at': datetime.now(timezone.utc).isoformat(),
-             'errors': errors,
-             **merge_evidence(previous, rows, complete, funding)}
-    fd, temporary = tempfile.mkstemp(dir=cache_path.parent, prefix='.platform-history-')
-    try:
-        with os.fdopen(fd, 'w') as out:
-            os.fchmod(out.fileno(), 0o600) if hasattr(os, 'fchmod') else None
-            json.dump(cache, out, ensure_ascii=False, allow_nan=False)
-        os.replace(temporary, cache_path)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+    store_evidence(ROOT / 'data', rows, complete, funding, errors)
     print(json.dumps({'success': not errors, 'orders_submitted': False, 'venues': venues, 'symbols': symbols,
                       'rows': rows, 'errors': errors, 'funding_intervals': len(funding),
                       'message': '已读取平台成交、手续费和持仓期间资金费；完整证据自动核算净盈亏，缺失项逐笔列明。' +

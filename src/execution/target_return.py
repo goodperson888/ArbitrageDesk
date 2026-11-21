@@ -70,7 +70,15 @@ def exit_projection(buy_quote, sell_quote, target_bps, buy_close_slip,
                 funding_reference_price=funding_reference,
                 exit_credit_per_unit=close_sell - close_buy - fees - funding_cost,
                 target_buy_ask=target_b_mid * b_ask / b_mid,
-                target_sell_bid=target_s_mid * s_bid / s_mid)
+                target_sell_bid=target_s_mid * s_bid / s_mid,
+                # Numeric inputs only; reuse the existing projection record
+                # to explain changing exit estimates without another I/O.
+                quote_inputs=dict(buy_bid=b_bid, buy_ask=b_ask,
+                    sell_bid=s_bid, sell_ask=s_ask,
+                    buy_fee_bps=float(buy_quote['fee_bps']), sell_fee_bps=float(sell_quote['fee_bps']),
+                    buy_close_slippage_bps=float(buy_close_slip),
+                    sell_close_slippage_bps=float(sell_close_slip),
+                    funding_reserve_bps=float(funding_reserve_bps)))
 
 
 def projected_return(buy, sell, quantity, buy_fee_bps, sell_fee_bps,

@@ -45,6 +45,8 @@ FIELDS.add('preparation')
 FIELDS.update(('requested_quantity', 'book_utilization_percent', 'paired_depth_quantity', 'depth_quantity_limit'))
 FIELDS.update(('raw_status', 'time_in_force', 'limit_price', 'platform_reason_code',
                'platform_reason', 'platform_reason_reported', 'evidence_source'))
+FIELDS.update(('receipt_source', 'receipt_path', 'receipt_lookup_ms',
+               'receipt_ws_ready', 'receipt_rest_started', 'receipt_ws_grace_ms'))
 
 
 class TradeHistory:

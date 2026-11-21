@@ -2,13 +2,17 @@
 import threading
 import time
 
-from src.common.market_data import utc_now
+from src.common.market_data import utc_now, age_seconds
 
 
 class HistorySync:
-    def __init__(self, fetch, execution_active, now=time.monotonic, interval=180):
+    def __init__(self, fetch, execution_active, now=time.monotonic, interval=180,
+                 pending_fetch=None, read_ready=lambda: False, pending_interval=600):
         self.fetch, self.execution_active, self.now = fetch, execution_active, now
         self.interval = interval
+        self.pending_fetch, self.read_ready = pending_fetch, read_ready
+        self.pending_interval = pending_interval
+        self._pending_next, self._pending_failures = {}, {}
         self._guard = threading.Lock()
         self._thread = None
         self._next = {}
@@ -24,6 +28,8 @@ class HistorySync:
             if self._thread and self._thread.is_alive():
                 return dict(self._state)
             if self.execution_active():
+                if self.pending_fetch is not None:
+                    return self._poll_pending(overview)
                 return {**self._state, 'state': 'deferred',
                         'message': '实盘运行期间复用已有成交证据，结束后自动补查平台历史'}
             groups = {}
@@ -53,6 +59,54 @@ class HistorySync:
             if groups and not due and result.get('state') != 'refreshing':
                 result['retry_after_seconds'] = max(0, round(max(self._global_next, min(self._next.get(pair, current) for pair in groups)) - current))
             return result
+
+    def _poll_pending(self, overview):
+        current = self.now()
+        rows = [row for row in overview.get('closed_positions', []) if row.get('id') and
+                row.get('status') == 'closed' and row.get('accounting_pending') and
+                row.get('recovered_close_fills')]
+        due = []
+        for row in rows:
+            check = row.get('accounting_check') or {}
+            age = age_seconds(check.get('checked_at'))
+            if age is not None and age < check.get('retry_after_seconds', self.pending_interval):
+                continue
+            if current >= max(self._global_next, self._pending_next.get(row['id'], 0)):
+                due.append(row)
+        if not due or not self.read_ready():
+            return {**self._state, 'state': 'deferred',
+                    'message': '已平仓账务后台低频补查；交易与持仓核验优先，未知费用继续保留'}
+        row = min(due, key=lambda item: self._pending_next.get(item['id'], 0))
+        self._pending_next[row['id']] = current + self.pending_interval
+        self._global_next = current + self.pending_interval
+        self._state = dict(state='refreshing', symbols=[row['symbol']],
+                           message='正在后台补查已平仓记录的缺失账务，最多两项')
+        self._thread = threading.Thread(target=self._run_pending, args=(row.copy(),), daemon=True)
+        self._thread.start()
+        return dict(self._state)
+
+    def _run_pending(self, row):
+        try:
+            report = (self.pending_fetch(row) if self.read_ready() else
+                      dict(deferred=True, complete=False, orders_submitted=False))
+            complete = report.get('complete') is True and report.get('orders_submitted') is False
+            with self._guard:
+                if report.get('deferred') and not report.get('reads'):
+                    self._pending_next[row['id']] = self.now() + 30
+                    self._global_next = self.now() + 30
+                    self._state = dict(state='deferred', message='交易或行情请求优先，账务补查稍后自动继续')
+                    return
+                failures = 0 if complete else self._pending_failures.get(row['id'], 0) + 1
+                self._pending_failures[row['id']] = failures
+                self._pending_next[row['id']] = self.now() + min(1800, self.pending_interval * 2 ** min(failures, 2))
+                self._state = dict(state='ready' if complete else 'partial', checked_at=utc_now(),
+                    symbols=[row['symbol']], errors=report.get('errors', []),
+                    message='已平仓缺失账务已自动补齐' if complete else
+                    '缺失账务仍待平台返回，后台自动重试；未知手续费不按零计入')
+        except Exception:
+            with self._guard:
+                self._pending_next[row['id']] = self.now() + 1800
+                self._state = dict(state='partial', checked_at=utc_now(), message='账务补查暂不可用，稍后自动重试')
 
     def _run(self, pair, symbols):
         try:

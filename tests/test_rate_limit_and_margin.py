@@ -141,14 +141,64 @@ class RateLimitTests(unittest.TestCase):
             self.assertEqual(sum(pool.map(reserve, range(8))), 1)
 
     def test_exponential_backoff_and_expiry(self):
+        with patch('src.common.rate_limit.random.uniform', return_value=0):
+            for now, seconds in ((1000, 5), (1006, 10), (1017, 20)):
+                with patch('src.common.rate_limit.time.time', return_value=now):
+                    with self.assertRaises(RateLimitError) as error:
+                        self.gate.reject(self.response('invalid'))
+                    self.assertEqual(error.exception.retry_after_seconds, seconds)
+        with patch('src.common.rate_limit.time.time', return_value=1038):
+            self.gate.check()
+
+    def test_concurrent_429_burst_counts_once_and_longer_retry_after_still_wins(self):
+        other = RateLimitGate('https://exchange.test', self.tmp.name)
         with patch('src.common.rate_limit.time.time', return_value=1000), \
                 patch('src.common.rate_limit.random.uniform', return_value=0):
-            for seconds in (5, 10, 20):
+            for _ in range(8):
                 with self.assertRaises(RateLimitError) as error:
-                    self.gate.reject(self.response('invalid'))
-                self.assertEqual(error.exception.retry_after_seconds, seconds)
-        with patch('src.common.rate_limit.time.time', return_value=1021):
-            self.gate.check()
+                    other.reject(self.response())
+                self.assertEqual(error.exception.retry_after_seconds, 5)
+            self.assertEqual(self.gate._read()['failures'], 1)
+            with self.assertRaises(RateLimitError) as error:
+                other.reject(self.response('93'))
+            self.assertEqual(error.exception.retry_after_seconds, 93)
+            self.assertEqual(self.gate._read()['failures'], 1)
+
+    def test_recovery_slows_only_background_probes_and_expires(self):
+        other = RateLimitGate('https://exchange.test', self.tmp.name)
+        with patch('src.common.rate_limit.time.time', return_value=1000), \
+                patch('src.common.rate_limit.random.uniform', return_value=0):
+            with self.assertRaises(RateLimitError):
+                self.gate.reject(self.response())
+        with patch('src.common.rate_limit.time.time', return_value=1006):
+            self.gate.reserve_discovery()
+        with patch('src.common.rate_limit.time.time', return_value=1008):
+            self.assertEqual(other.discovery_delay(), 2)
+            self.assertEqual(other.discovery_delay(priority=True), 0)
+            with self.assertRaises(DiscoveryThrottleError):
+                other.reserve_discovery()
+            other.reserve_discovery(priority=True)
+            other.check()  # Required account/close reads have no local wait.
+        with patch('src.common.rate_limit.time.time', return_value=1070):
+            other.reserve_discovery()
+        with patch('src.common.rate_limit.time.time', return_value=1072):
+            self.gate.reserve_discovery()  # Original cadence is restored.
+
+    def test_priority_reservation_preserves_background_recovery_deadline(self):
+        with patch('src.common.rate_limit.time.time', return_value=1000), \
+                patch('src.common.rate_limit.random.uniform', return_value=0):
+            with self.assertRaises(RateLimitError):
+                self.gate.reject(self.response())
+        # Model repeated independent episodes, not parallel replies from one.
+        state = self.gate._read()
+        state['failures'] = 3
+        self.gate.path.write_text(json.dumps(state))
+        with patch('src.common.rate_limit.time.time', return_value=1006):
+            self.gate.reserve_discovery()
+        with patch('src.common.rate_limit.time.time', return_value=1007):
+            self.assertEqual(self.gate.discovery_delay(priority=True), 1)
+        with patch('src.common.rate_limit.time.time', return_value=1009):
+            self.assertEqual(self.gate.discovery_delay(), 13)
 
     def test_public_client_never_retries_429_even_with_zero_cache_ttl(self):
         session = Mock()

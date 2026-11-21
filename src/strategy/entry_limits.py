@@ -2,9 +2,10 @@
 import copy
 import math
 from src.common.sizing import book_utilization_percent
+from src.execution.capital_budget import CAPITAL_DEFAULTS, capital_policy
 
 
-ENTRY_LIMIT_KEYS = ('position_size', 'max_positions', 'max_total_position_notional')
+ENTRY_LIMIT_KEYS = ('position_size', 'max_positions', 'max_total_position_notional', *CAPITAL_DEFAULTS)
 
 
 def validated_entry_limits(config):
@@ -20,7 +21,7 @@ def validated_entry_limits(config):
                 (key == 'max_positions' and int(value) != value)):
             raise ValueError('新开仓限制无效：' + key)
         result[key] = int(value) if key == 'max_positions' else float(value)
-    return result
+    return dict(result, **capital_policy(trading))
 
 
 class EntryLimitsMixin:
@@ -39,8 +40,8 @@ class EntryLimitsMixin:
     def _reload_open_entry_limits(self, loaded, mtime):
         if mtime == getattr(self, '_entry_limits_mtime_ns', self._config_mtime_ns):
             return False
-        before = {key: self.config.get('trading', {}).get(key, default) for key, default in
-                  zip(ENTRY_LIMIT_KEYS, (100, 1, 0))}
+        defaults = dict(position_size=100, max_positions=1, max_total_position_notional=0, **CAPITAL_DEFAULTS)
+        before = {key: self.config.get('trading', {}).get(key, default) for key, default in defaults.items()}
         previous_utilization = self.book_utilization_percent
         # Validate all three before touching any live value. Positions, exit
         # policy, grid parameters and venue/session objects remain untouched.
@@ -69,6 +70,16 @@ class EntryLimitsMixin:
             return value
         return policy(loaded) != policy(self.config)
 
+    def entry_capital_policy(self):
+        policy = capital_policy(self.config.get('trading', {}))
+        if not (policy['capital_reserve_percent'] or policy['capital_reserve_usdc'] or
+                policy['capital_allocation_mode'] != 'per_leg'):
+            return None
+        remaining = self.max_positions - sum(p.status != 'closed' for p in self.positions)
+        if remaining < 1:
+            raise ValueError('已达到最大同时持仓组数，首腿未提交')
+        return dict(policy, remaining_slots=remaining)
+
     def entry_limits_status(self):
         with self.lock:
             cap = self.config.get('execution_notional_cap')
@@ -84,6 +95,7 @@ class EntryLimitsMixin:
             sources = [name for name, value in limits.items() if value == effective and
                        (name != '本次累计目标剩余额度' or value < min(saved_cap, cap if cap is not None else saved_cap))]
             return dict(version=1, max_positions=self.max_positions,
+                        capital_policy_version=1, **capital_policy(self.config.get('trading', {})),
                         max_total_position_notional=self.max_total_position_notional,
                         position_size=self.position_size,
                         saved_position_size=self.config.get('trading', {}).get('position_size', self.position_size),

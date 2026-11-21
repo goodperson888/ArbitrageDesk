@@ -101,6 +101,7 @@ execution_console = ExecutionConsole(ROOT, diagnostics)
 from src.web.history_marks import HistoryMarks, HistoryMarkAdapter
 history_marks = HistoryMarks()
 from src.web.history_sync import HistorySync
+from src.execution.pending_accounting import read_allowed as accounting_read_allowed
 
 
 def _history_execution_active():
@@ -115,7 +116,9 @@ def _history_execution_active():
 
 
 history_sync = HistorySync(lambda venues, symbols, limit: execution_console.platform_history(venues, symbols, limit),
-                           _history_execution_active)
+                           _history_execution_active,
+                           pending_fetch=lambda row: execution_console.pending_accounting(row),
+                           read_ready=lambda: accounting_read_allowed(ROOT))
 
 
 def init_system(config_path=None):
@@ -617,11 +620,11 @@ def execution_control():
         reversion_min_samples = int(reversion_min_samples or 0)
     except (TypeError, ValueError):
         return jsonify(error='历史回归筛选无效'), 400
-    if (not 300 <= reversion_window_seconds <= 604800 or reversion_min_count < 0 or
+    if (not 300 <= reversion_window_seconds <= 7776000 or reversion_min_count < 0 or
             reversion_min_deviation_bps < 0 or reversion_max_age_seconds < 0 or
             reversion_min_samples < 0 or
             not all(math.isfinite(value) for value in (reversion_min_deviation_bps, reversion_max_age_seconds))):
-        return jsonify(error='历史回归筛选必须为非负数，窗口应在 5 分钟至 7 天'), 400
+        return jsonify(error='历史回归筛选必须为非负数，窗口应在 5 分钟至 90 天'), 400
     try:
         gross_spread_min_bps = float(gross_spread_min_bps or 0)
         gross_spread_max_bps = float(gross_spread_max_bps or 0)
@@ -1169,6 +1172,8 @@ def execution_history():
                 row.setdefault('close_diagnostics', {'status': 'unavailable', 'text': '平仓决策诊断暂不可读；不影响交易执行，请稍后查看。'})
     from src.execution.manual_close import annotate_controls
     annotate_controls(execution_console, overview.get('open_positions', []))
+    from src.web.history_fee_estimates import apply_fee_estimates, verified_lighter_rate
+    apply_fee_estimates(overview, verified_lighter_rate(execution_profile_path, credentials_path))
     return jsonify({'events': strategy.history.recent(event_page_size, (event_page - 1) * event_page_size),
                     'events_total': strategy.history.count(), 'events_page': event_page,
                     'events_page_size': event_page_size, 'events_scope': 'all',
@@ -1226,6 +1231,22 @@ def handle_config():
                 monitor = _position_monitor_payload().get('monitor') or {}
                 if monitor.get('heartbeat_stale') or monitor.get('channel_policy_version',0) < 1:
                     return jsonify(success=False,error='当前实盘进程尚未加载通道策略；请待原仓按原规则处理完并结束本次运行，再保存通道策略及重新启动。配置未修改。'),409
+                channel = payload['strategy'].get('channel_policy',{})
+                method = (channel.get('method',config_loader.get('strategy.channel_policy.method','quantile'))
+                          if isinstance(channel,dict) else None)
+                if method == 'touches' and monitor.get('channel_policy_version',0) < 2:
+                    return jsonify(success=False,error='当前实盘进程尚未加载反复触碰通道；请待原仓按原规则处理完并结束本次运行，重新加载服务后再保存。配置未修改。'),409
+            if execution['running'] and isinstance(payload,dict) and isinstance(payload.get('strategy'),dict):
+                from src.execution.capital_budget import capital_policy
+                trading = payload['strategy'].get('trading', {})
+                if isinstance(trading,dict):
+                    policy = capital_policy(dict(config_loader.get('strategy.trading', {}), **trading))
+                    enabled = (policy['capital_reserve_percent'] or policy['capital_reserve_usdc'] or
+                               policy['capital_allocation_mode'] != 'per_leg')
+                    if enabled:
+                        monitor = _position_monitor_payload().get('monitor') or {}
+                        if (monitor.get('entry_limits') or {}).get('capital_policy_version') != 1:
+                            return jsonify(success=False,error='当前实盘进程未加载资金预留功能；请在本次执行安全结束后启动新版，再保存预留设置。配置未修改。'),409
             config_loader.update_strategy(payload)
         except (ValueError, TypeError) as exc:
             return jsonify(success=False, error=str(exc)), 400
@@ -1234,7 +1255,7 @@ def handle_config():
             # Saving must not mutate or restart the in-flight worker here.
             return jsonify(success=True, pending=True,
                            apply_scope='new_entries',
-                           message='配置已保存；持仓数量与金额上限在下次开仓检查前应用，其他策略设置待全部平仓后生效。已有仓位继续按原规则管理；实际生效值见持仓上限状态。')
+                           message='配置已保存；持仓数量、金额上限及资金预留在下次开仓检查前应用，其他策略设置待全部平仓后生效。已有仓位继续按原规则管理；实际生效值见持仓上限状态。')
         strategy.config = copy.deepcopy(config_loader.get_strategy_config())
         strategy.config['config_path'] = str(config_loader.config_path)
         # Rebuild only after a validated, durable write.
@@ -1659,6 +1680,8 @@ def start_monitor():
 
 
 if __name__ == '__main__':
+    from src.common.quote_clock import quote_clock
+    quote_clock.start()
     init_system()
     start_monitor()
     if (ROOT/'data/quote-observer.enabled').exists():

@@ -64,6 +64,8 @@ def main():
         raise SystemExit('金额和等待秒数必须为非负数')
 
     root = ROOT
+    from src.common.quote_clock import quote_clock
+    quote_clock.start()
     values = _arcus_values(root)
     try:
         evidence = json.loads((root / 'data/platform-verification.json').read_text())['arcus']

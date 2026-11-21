@@ -13,6 +13,17 @@ from test_execution import market, order
 from src.execution.orders import lighter_plan
 
 
+def assert_observed_order(case, row, source, path):
+    case.assertEqual({k: v for k, v in row.items() if k != '_receipt_diagnostics'}, order())
+    diagnostics = row['_receipt_diagnostics']
+    case.assertEqual(diagnostics['receipt_source'], source)
+    case.assertEqual(diagnostics['receipt_path'], path)
+    case.assertGreaterEqual(diagnostics['receipt_lookup_ms'], 0)
+    case.assertGreaterEqual(diagnostics['receipt_ws_grace_ms'], 0)
+    case.assertIsInstance(diagnostics['receipt_ws_ready'], bool)
+    case.assertIsInstance(diagnostics['receipt_rest_started'], bool)
+
+
 class LighterReceiptTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.plan = lighter_plan(market(), 'BTC', 'buy', 1, 100, 10)
@@ -38,7 +49,8 @@ class LighterReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.sdk.ORDER_TYPE_LIMIT = self.sdk.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL = 0
         self.sdk.DEFAULT_IOC_EXPIRY = 0
         await self.transport.submit(self.plan, 123)
-        self.assertEqual(await self.transport.find_order(1, 123), order())
+        assert_observed_order(self, await self.transport.find_order(1, 123), 'websocket', 'cached_push')
+        self.assertNotIn('_receipt_diagnostics', self.stream.order(1, 123))
         self.transport._find_order_rest.assert_not_awaited()
         self.sdk.create_order.assert_awaited_once()
 
@@ -47,9 +59,113 @@ class LighterReceiptTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(.005)
             self.push([order()])
         update_task = asyncio.create_task(update())
-        self.assertEqual(await self.transport.find_order(1, 123), order())
+        row = await self.transport.find_order(1, 123)
+        assert_observed_order(self, row, 'websocket', 'grace_push')
+        self.assertFalse(row['_receipt_diagnostics']['receipt_rest_started'])
         await update_task
         self.transport._find_order_rest.assert_not_awaited()
+
+    async def test_valid_terminal_releases_submit_before_http_without_canceling_send(self):
+        entered, release, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        async def slow_send(**kwargs):
+            entered.set()
+            try:
+                await release.wait()
+                return None, {'code': 200}, None
+            finally:
+                finished.set()
+        self.sdk.create_order = AsyncMock(side_effect=slow_send)
+        submitting = asyncio.create_task(self.transport.submit(self.plan, 123))
+        try:
+            await entered.wait()
+            self.push([order()])
+            result = await asyncio.wait_for(submitting, .2)
+            self.assertTrue(result['terminal_observed'])
+            self.assertFalse(finished.is_set())
+            assert_observed_order(self, await self.transport.find_order(1, 123), 'websocket', 'cached_push')
+            self.transport._find_order_rest.assert_not_awaited()
+            self.sdk.create_order.assert_awaited_once()
+        finally:
+            release.set()
+            await self.transport._drain_sends()
+            await submitting
+        self.assertTrue(finished.is_set())
+
+    async def test_same_signer_waits_for_http_cleanup_then_rechecks_deadline(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def slow_send(**kwargs):
+            entered.set()
+            await release.wait()
+            return None, {'code': 200}, None
+        self.sdk.create_order = AsyncMock(side_effect=slow_send)
+        submitting = asyncio.create_task(self.transport.submit(self.plan, 123))
+        second = None
+        try:
+            await entered.wait()
+            self.push([order()])
+            await asyncio.wait_for(submitting, .2)
+            # The second plan expires while the first HTTP is still returning.
+            from src.execution.orders import SubmissionWindowExpired
+            import time
+            plan = dict(self.plan, submit_deadline_monotonic=time.monotonic() + .02)
+            second = asyncio.create_task(self.transport.submit(plan, 124))
+            await asyncio.sleep(0)
+            self.assertFalse(second.done())
+            self.sdk.create_order.assert_awaited_once()
+            with self.assertRaises(SubmissionWindowExpired):
+                await asyncio.wait_for(second, .2)
+            self.sdk.create_order.assert_awaited_once()
+            self.assertTrue(self.transport._sends, 'expiry cannot cancel the previous signed HTTP')
+        finally:
+            release.set()
+            await self.transport._drain_sends()
+            await submitting
+            if second is not None:
+                await asyncio.gather(second, return_exceptions=True)
+
+    async def test_invalid_push_cannot_release_an_unfinished_send(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def slow_send(**kwargs):
+            entered.set()
+            await release.wait()
+            return None, {'code': 200}, None
+        self.sdk.create_order = AsyncMock(side_effect=slow_send)
+        submitting = asyncio.create_task(self.transport.submit(self.plan, 123))
+        try:
+            await entered.wait()
+            for row in (order(status='open', size='0'), dict(order(), reduce_only=True),
+                        dict(order(), owner_account_index=8)):
+                self.push([row])
+                await asyncio.sleep(0)
+                self.assertFalse(submitting.done())
+            release.set()
+            self.assertTrue((await submitting)['accepted'])
+        finally:
+            release.set()
+            await self.transport._drain_sends()
+            await submitting
+
+    async def test_late_http_failure_cannot_replace_verified_terminal_or_resend(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def slow_send(**kwargs):
+            entered.set()
+            await release.wait()
+            raise RuntimeError('private transport detail')
+        self.sdk.create_order = AsyncMock(side_effect=slow_send)
+        submitting = asyncio.create_task(self.transport.submit(self.plan, 123))
+        try:
+            await entered.wait()
+            self.push([order(status='canceled', size='0')])
+            self.assertTrue((await asyncio.wait_for(submitting, .2))['terminal_observed'])
+            release.set()
+            await self.transport._drain_sends()
+            row = await self.transport.find_order(1, 123)
+            self.assertEqual(terminal_receipt(row, self.plan, 7, 123, [])['filled_size'], 0)
+            self.sdk.create_order.assert_awaited_once()
+        finally:
+            release.set()
+            await self.transport._drain_sends()
+            await submitting
 
     async def test_push_interrupts_inflight_slow_rest(self):
         entered, canceled = asyncio.Event(), asyncio.Event()
@@ -63,7 +179,9 @@ class LighterReceiptTests(unittest.IsolatedAsyncioTestCase):
         task = asyncio.create_task(self.transport.find_order(1, 123))
         await asyncio.wait_for(entered.wait(), .5)
         self.push([order()])
-        self.assertEqual(await asyncio.wait_for(task, .2), order())
+        row = await asyncio.wait_for(task, .2)
+        assert_observed_order(self, row, 'websocket', 'race_push')
+        self.assertTrue(row['_receipt_diagnostics']['receipt_rest_started'])
         self.assertTrue(canceled.is_set())
 
     async def test_lagging_history_does_not_force_another_poll_cycle(self):
@@ -78,7 +196,7 @@ class LighterReceiptTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(entered.wait(), .5)
             await asyncio.sleep(0)
             self.push([order()])
-            self.assertEqual(await asyncio.wait_for(task, .2), order())
+            assert_observed_order(self, await asyncio.wait_for(task, .2), 'websocket', 'after_lagging_rest')
 
     async def test_ready_push_bypasses_shared_rest_cooldown(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -87,7 +205,7 @@ class LighterReceiptTests(unittest.IsolatedAsyncioTestCase):
                 gate.reject(SimpleNamespace(status_code=429, headers={'Retry-After': '30'}))
             self.transport.rate_limit = gate
             self.push([order()])
-            self.assertEqual(await self.transport.find_order(1, 123), order())
+            assert_observed_order(self, await self.transport.find_order(1, 123), 'websocket', 'cached_push')
             self.transport._find_order_rest.assert_not_awaited()
 
     async def test_rest_failure_can_still_receive_imminent_terminal(self):
@@ -99,11 +217,14 @@ class LighterReceiptTests(unittest.IsolatedAsyncioTestCase):
         task = asyncio.create_task(self.transport.find_order(1, 123))
         await asyncio.wait_for(entered.wait(), .5)
         self.push([order()])
-        self.assertEqual(await asyncio.wait_for(task, .2), order())
+        assert_observed_order(self, await asyncio.wait_for(task, .2), 'websocket', 'after_rest_error')
 
     async def test_disconnected_falls_back_without_grace(self):
         self.stream._reset()
-        self.assertEqual(await asyncio.wait_for(self.transport.find_order(1, 123), .05), order())
+        row = await asyncio.wait_for(self.transport.find_order(1, 123), .05)
+        assert_observed_order(self, row, 'rest', 'race_rest')
+        self.assertFalse(row['_receipt_diagnostics']['receipt_ws_ready'])
+        self.assertEqual(row['_receipt_diagnostics']['receipt_ws_grace_ms'], 0)
         self.transport._find_order_rest.assert_awaited_once_with(1, 123)
 
     async def test_open_missing_partial_or_wrong_identity_use_rest(self):
@@ -121,7 +242,7 @@ class LighterReceiptTests(unittest.IsolatedAsyncioTestCase):
                 self.stream.arm(self.plan, 123)
                 self.push([row])
                 self.assertIsNone(self.stream.order(1, 123))
-        self.assertEqual(await self.transport.find_order(1, 123), order())
+        assert_observed_order(self, await self.transport.find_order(1, 123), 'rest', 'race_rest')
         self.transport._find_order_rest.assert_awaited_once()
 
     async def test_terminal_partial_preserves_actual_size_and_vwap(self):
@@ -133,6 +254,36 @@ class LighterReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(receipt['average_price'], 100)
         self.assertIsNone(receipt['fees_usdc'])  # Never invent fee evidence.
         self.transport._find_order_rest.assert_not_awaited()
+
+    async def test_receipt_source_survives_validation_and_history_without_private_payload(self):
+        from src.execution.history import TradeHistory
+        from src.strategy.arbitrage_strategy import ArbitrageStrategy
+        self.push([order()])
+        row = await self.transport.find_order(1, 123)
+        row['_receipt_diagnostics']['auth'] = 'private-token'
+        receipt = terminal_receipt(row, self.plan, 7, 123, [])
+        self.assertEqual(receipt['receipt_source'], 'websocket')
+        self.assertNotIn('auth', receipt)
+        self.assertEqual(receipt['filled_size'], 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            history = TradeHistory(tmp + '/events.sqlite')
+            for event in ('entry_receipt', 'close_receipt'):
+                ArbitrageStrategy._record_receipt(SimpleNamespace(history=history), event,
+                    SimpleNamespace(id='test-position', symbol='BTC'), 'lighter', receipt)
+            for event in history.recent():
+                self.assertEqual(event['detail']['receipt_path'], 'cached_push')
+                self.assertEqual(event['detail']['receipt_source'], 'websocket')
+                self.assertNotIn('private-token', json.dumps(event))
+
+    async def test_rest_without_subscription_labels_receipt_and_does_not_mutate_order(self):
+        self.transport.order_stream = None
+        raw = order()
+        self.transport._find_order_rest.return_value = raw
+        row = await self.transport.find_order(1, 123)
+        assert_observed_order(self, row, 'rest', 'no_stream')
+        self.assertTrue(row['_receipt_diagnostics']['receipt_rest_started'])
+        self.assertNotIn('_receipt_diagnostics', raw)
+        self.transport._find_order_rest.assert_awaited_once_with(1, 123)
 
     async def test_zero_fill_cancellation_is_terminal(self):
         self.push([order(status='canceled', size='0')])
@@ -261,7 +412,7 @@ class SDKLoopPushTests(unittest.TestCase):
             try:
                 with self.assertRaises(RateLimitError):
                     loop.transport.rate_limit.reject(SimpleNamespace(status_code=429, headers={'Retry-After': '30'}))
-                self.assertEqual(loop.call('find_order', 1, 123), order())
+                assert_observed_order(self, loop.call('find_order', 1, 123), 'websocket', 'cached_push')
                 loop.transport.sdk.create_auth_token_with_expiry.assert_not_called()
             finally:
                 loop.close()

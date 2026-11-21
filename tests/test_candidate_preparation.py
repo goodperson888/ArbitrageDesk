@@ -83,6 +83,21 @@ class CandidateSchedulingTests(unittest.TestCase):
         finally:
             release.set()
 
+    def test_execution_quality_only_breaks_profit_ties_at_four_decimal_precision(self):
+        self.s.execution_quality_rank = lambda op: 1 if op.symbol == 'A' else 0
+        candidates = [opportunity('A', 1.00001), opportunity('B', 1.00002)]
+        with self.worker._discovery_session():
+            for op in candidates:
+                self.worker._preparation_ready[op.symbol] = self.s.prepare_entry_candidate(op)
+            selected = self.worker._collect_prepared(candidates, set())
+            self.assertEqual(selected['opportunity'].symbol, 'A')
+            self.worker._preparation_ready.clear()
+            candidates[1].edge = 1.01
+            for op in candidates:
+                self.worker._preparation_ready[op.symbol] = self.s.prepare_entry_candidate(op)
+            selected = self.worker._collect_prepared(candidates, set())
+            self.assertEqual(selected['opportunity'].symbol, 'B')
+
     def test_rejection_refreshes_ranking_and_cannot_submit_an_old_second_choice(self):
         self.worker._candidate_opportunities = Mock(side_effect=[
             [opportunity('A',4),opportunity('B',2)], [opportunity('NEW',8)]])

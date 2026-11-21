@@ -115,6 +115,10 @@ def recover_leg(position, leg, orders):
             'identity_matched': explicitly_matched,
             'gross_price_pnl_usdc': str(gross),
             'fees_usdc': str(fees) if fees_known else None,
+            'fee_components': [dict(order_id=r['order_id'], notional_usdc=str(
+                Decimal(r['filled_size']) * Decimal(r['average_price'])),
+                fees_usdc=r.get('fees_usdc') if r.get('fee_estimated') is not True and
+                r.get('fee_source') != 'account_rate_estimate' else None) for r in all_orders],
             'missing_fees': [('开仓' if r in entries else '平仓') + '手续费（订单 ' + r['order_id'] + '）'
                              for r in all_orders if r.get('fees_usdc') is None or
                              r.get('fee_estimated') is True or r.get('fee_source') == 'account_rate_estimate'] or
@@ -186,6 +190,7 @@ def apply_close_history(book, data_dir):
     complete = {tuple(item) for item in cache.get('complete_markets', [])}
     promoted = []
     for position in book.get('closed_positions', []) + book.get('open_positions', []):
+        position['accounting_check'] = (cache.get('accounting_checks') or {}).get(position.get('id'))
         was_open = position.get('status') != 'closed' and position in book.get('open_positions', [])
         recovered = {}
         accounting = {}

@@ -24,6 +24,25 @@ class TargetTrader(Trader):
 
 
 class ReturnMathTests(unittest.TestCase):
+    def test_exit_projection_records_inputs_that_explain_wider_exit_book(self):
+        buy = dict(quote(99.98, 100.02, 2), auth='private-token', raw={'secret': 'value'})
+        sell = quote(100.08, 100.12, 3)
+        before = exit_projection(buy, sell, 20, 2, 4, 6)
+        after = exit_projection(dict(buy, bid=99.90), sell, 20, 2, 4, 6)
+        inputs = after['quote_inputs']
+        self.assertEqual(inputs, dict(buy_bid=99.90, buy_ask=100.02,
+            sell_bid=100.08, sell_ask=100.12, buy_fee_bps=2, sell_fee_bps=3,
+            buy_close_slippage_bps=2, sell_close_slippage_bps=4, funding_reserve_bps=6))
+        self.assertNotIn('private-token', json.dumps(after))
+        self.assertEqual(before['target_bps'], after['target_bps'])
+        self.assertLess(after['exit_credit_per_unit'], before['exit_credit_per_unit'])
+        # Diagnostics are sufficient to replay the same arithmetic offline.
+        replay = exit_projection(quote(inputs['buy_bid'], inputs['buy_ask'], inputs['buy_fee_bps']),
+            quote(inputs['sell_bid'], inputs['sell_ask'], inputs['sell_fee_bps']),
+            after['target_bps'], inputs['buy_close_slippage_bps'], inputs['sell_close_slippage_bps'],
+            inputs['funding_reserve_bps'], after['funding_reference_price'])
+        self.assertEqual(replay, after)
+
     def test_target_prices_preserve_signed_history_formula_and_charge_four_fees(self):
         buy, sell = quote(99.98, 100.02, 2), quote(100.08, 100.12, 3)
         for target in (-30, 0, 20):
@@ -105,6 +124,34 @@ class TargetEntryTests(unittest.TestCase):
                 bid=t.price, ask=t.price, fee_bps=fee,
                 bid_size=100 if sizes else None, ask_size=100 if sizes else None,
                 updated_at=(datetime.now(timezone.utc)-timedelta(seconds=age)).isoformat())
+
+    def test_lit_style_post_fill_move_uses_remaining_return_with_hard_price_limit(self):
+        self.a.price,self.b.price=2.5233,2.5298
+        self.stats={'buy_variational':0,'sell_variational':0}
+        original=self.a.place_order
+        def sent(*args,**kwargs):
+            receipt=original(*args,**kwargs); self.b.price=2.5274
+            return receipt
+        with patch.object(self.a,'place_order',side_effect=sent):
+            self.assertTrue(self.s.execute_arbitrage(self.op))
+        decision=next(e['detail'] for e in self.s.history.recent() if e['event']=='hedge_decision')
+        self.assertEqual(decision['decision'],'hedge')
+        self.assertGreater(decision['observed_net_edge_bps'],5)
+        self.assertEqual(len(self.b.sends),1)
+
+    def test_target_return_room_does_not_override_hard_slippage_limit(self):
+        self.a.price,self.b.price=2.5233,2.5298
+        self.stats={'buy_variational':0,'sell_variational':0}
+        original=self.a.place_order
+        def sent(*args,**kwargs):
+            receipt=original(*args,**kwargs); self.b.price=2.5268
+            return receipt
+        with patch.object(self.a,'place_order',side_effect=sent):
+            self.assertFalse(self.s.execute_arbitrage(self.op))
+        decision=next(e['detail'] for e in self.s.history.recent() if e['event']=='hedge_decision')
+        self.assertGreater(decision['observed_net_edge_bps'],5)
+        self.assertEqual(self.b.sends,[])
+        self.assertEqual(self.s.positions[-1].rollback_category,'price')
 
     def test_opposite_bbo_failure_is_observed_but_does_not_veto_next_fresh_entry(self):
         original_quote = self.a.get_executable_quote

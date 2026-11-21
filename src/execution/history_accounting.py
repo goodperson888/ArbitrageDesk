@@ -4,6 +4,11 @@ from decimal import Decimal
 from datetime import datetime
 import json
 import sqlite3
+import os
+import tempfile
+from pathlib import Path
+from src.common import file_lock
+from src.common.market_data import utc_now
 
 from src.execution.orders import decimal
 from src.execution.history_recovery import timestamp
@@ -163,3 +168,33 @@ def merge_evidence(previous, rows, complete, funding):
         new['start'] <= r['start'] and new['end'] >= r['end'] for new in funding)] + funding
     return {'rows': list(combined.values()), 'funding_intervals': intervals,
             'complete_markets': sorted(refreshed | {tuple(m) for m in previous.get('complete_markets', [])})}
+
+
+def store_evidence(data_dir, rows, complete, funding, errors, checks=None):
+    """Merge against the latest cache under a history-only write lock."""
+    root = Path(data_dir)
+    path = root / 'platform-order-history.json'
+    with (root / '.platform-history.lock').open('a') as lock:
+        file_lock.flock(lock, file_lock.LOCK_EX)
+        try:
+            previous = json.loads(path.read_text())
+        except (OSError, ValueError):
+            previous = {}
+        accounting_checks = dict(previous.get('accounting_checks') or {})
+        accounting_checks.update(checks or {})
+        accounting_checks = dict(sorted(accounting_checks.items(),
+            key=lambda item: item[1].get('checked_at', ''))[-1000:])
+        cache = dict(orders_submitted=False, checked_at=utc_now(), errors=errors,
+                     accounting_checks=accounting_checks,
+                     **merge_evidence(previous, rows, complete, funding))
+        fd, temporary = tempfile.mkstemp(dir=root, prefix='.platform-history-')
+        try:
+            with os.fdopen(fd, 'w') as out:
+                if hasattr(os, 'fchmod'):
+                    os.fchmod(out.fileno(), 0o600)
+                json.dump(cache, out, ensure_ascii=False, allow_nan=False)
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+    return cache

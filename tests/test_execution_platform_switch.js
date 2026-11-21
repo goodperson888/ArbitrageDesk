@@ -221,6 +221,14 @@ const tick = () => new Promise(resolve=>setImmediate(resolve));
     await node('ops-refresh').onclick(); await node('execution-reset-stop').onclick();
     const reset=requests.find(r=>r.path.endsWith('/reset-stop'));
     assert.deepEqual(reset.payload.venues,['lighter','lighter_rh'],'reset must verify original accounts');
+    const beforeRecoveryExecution=execution, beforeRecoverySelected=selected;
+    selected=['lighter','lighter_rh','arcus'];
+    execution={...execution,venues:selected.slice(),execution_pair:['lighter','arcus'],
+        tracked_position_count:1,stop_requested:false,stop_completed:false};
+    await node('ops-refresh').onclick(); await node('execution-reset-stop').onclick();
+    assert.deepEqual(requests.filter(r=>r.path.endsWith('/reset-stop')).at(-1).payload.venues,
+        ['lighter','arcus'],'three-venue held recovery must use original pair even after STOP was cleared');
+    execution=beforeRecoveryExecution; selected=beforeRecoverySelected;
     assert.deepEqual(requests.filter(r=>/\/(once|wait-once|monitor|stop)$/.test(r.path)).map(r=>r.path),
         ['/api/execution/monitor'],'only the explicit simulated launch above may start; selection edits never start or stop');
     assert.match(node('execution-entry-risk').textContent,/旧订单不推测归类/);

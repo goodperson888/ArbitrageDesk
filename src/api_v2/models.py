@@ -126,6 +126,18 @@ class Opportunity(BaseModel):
     history_7d_raw_samples: int = 0
     history_7d_anomaly_count: int = 0
     history_7d_anomaly_threshold_bps: Optional[float] = None
+    # Statistics for the user-selected display window.  The legacy
+    # 24-hour and 7-day fields remain for compatibility with older clients.
+    history_target_window_seconds: int = 604800
+    history_target_min_bps: Optional[float] = None
+    history_target_max_bps: Optional[float] = None
+    history_target_avg_bps: Optional[float] = None
+    history_target_samples: int = 0
+    history_target_raw_min_bps: Optional[float] = None
+    history_target_raw_max_bps: Optional[float] = None
+    history_target_raw_samples: int = 0
+    history_target_anomaly_count: int = 0
+    history_target_anomaly_threshold_bps: Optional[float] = None
     # Route-specific mean-reversion diagnostics.  The target is the median
     # gross spread observed for this symbol and directed venue pair; it is
     # deliberately kept separate from the current signed net edge.

@@ -10,6 +10,7 @@ const node = id => {
 };
 const config = {strategy:{spread_threshold:{min:5,max:50},trading:{position_size:100,max_positions:1,max_total_position_notional:0,leverage:5,second_leg_retries:1},risk:{max_loss_per_trade:50,max_daily_loss:200,slippage_tolerance:10,entry_extra_profit_bps:3},wash_trading:{max_trades_per_day:100},entry_policy:{mode:'fixed',quantile:90,min_samples:300},close_policy:{mode:'convergence',target_mode:'center',convergence_basis:'remaining',convergence_bps:2,min_profit_usdc:0,min_profit_bps:0,cost_reserve_usdc:0,max_hold_seconds:3600},cost_model:{variational_fee_bps:0,funding_bps_per_8h:1}}};
 config.strategy.position_policy={mode:'single',step_bps:5,max_layers:3,layer_notional_usdc:12,total_notional_usdc:36};
+Object.assign(config.strategy.trading,{capital_reserve_percent:17,capital_reserve_usdc:4.5,capital_allocation_mode:'remaining_slots'});
 Object.assign(config.strategy.entry_policy,{calculation_version:2,target_window_seconds:604800,funding_reserve_bps:2});
 let saved;
 Object.assign(config.strategy.risk, {book_utilization_percent:80,execution_price_movement_bps:2,hedge_max_delay_seconds:5,

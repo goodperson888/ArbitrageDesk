@@ -159,6 +159,24 @@ class MultiPositionTests(unittest.TestCase):
         self.assertEqual(first.status, 'open')
         self.assertEqual(sum(len(t.closes) for t in (self.a, self.b, self.c)), 0)
 
+    def test_capital_settings_reload_with_existing_group_and_preserve_exit_policy(self):
+        first=self.enter('BTC')
+        saved,worker=self.saved_config(),self.worker()
+        old_key=self.s.entry_preparation_key()
+        old_exit=copy.deepcopy(self.s.get_strategy_status()['close_policy'])
+        self.save_limits(saved,{'trading':dict(capital_reserve_percent=20,capital_reserve_usdc=10,
+                                              capital_allocation_mode='remaining_slots')})
+        worker._reload_entry_configuration()
+        policy=self.s.entry_capital_policy()
+        self.assertEqual(policy['remaining_slots'],2)
+        self.assertEqual(policy['capital_reserve_percent'],20)
+        self.assertEqual(self.s.entry_limits_status()['capital_policy_version'],1)
+        self.assertNotEqual(self.s.entry_preparation_key(),old_key)
+        self.assertFalse(self.s.entry_limits_status()['pending_other_settings'])
+        self.assertEqual(self.s.get_strategy_status()['close_policy'],old_exit)
+        self.assertIs(self.s.positions[0],first)
+        self.assertEqual(sum(len(t.closes) for t in (self.a,self.b,self.c)),0)
+
     def test_three_to_two_waits_below_two_before_reusing_a_slot(self):
         first, second, third = (self.enter(symbol, route) for symbol, route in
                                 [('BTC', 0), ('ETH', 1), ('SOL', 2)])

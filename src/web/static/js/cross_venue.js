@@ -24,8 +24,8 @@
         scanStartedAt: null, hiddenStaleCount: 0
     };
     state.refreshMs = validRefreshMs(savedPrefs.refreshMs);
-    state.historyWindow = Number(savedPrefs.historyWindow) === 604800 ? 604800 : 86400;
-    state.reversionWindow = [86400, 259200, 604800].includes(Number(savedPrefs.reversionWindow)) ? Number(savedPrefs.reversionWindow) : 604800;
+    state.historyWindow = [86400, 604800, 2592000, 7776000].includes(Number(savedPrefs.historyWindow)) ? Number(savedPrefs.historyWindow) : 86400;
+    state.reversionWindow = [86400, 259200, 604800, 2592000, 7776000].includes(Number(savedPrefs.reversionWindow)) ? Number(savedPrefs.reversionWindow) : 604800;
     state.reversionMinCount = Number(savedPrefs.reversionMinCount) >= 0 ? Number(savedPrefs.reversionMinCount) : 0;
     state.reversionMinDeviationBps = Number(savedPrefs.reversionMinDeviationBps) >= 0 ? Number(savedPrefs.reversionMinDeviationBps) : 0;
     state.reversionRecencyMode = savedPrefs.reversionRecencyMode === 'soft' ? 'soft' : 'hard';
@@ -443,29 +443,37 @@
     function age(seconds) { return seconds == null ? '年龄未知' : (Number(seconds) < 1 ? '<1 秒' : Number(seconds).toFixed(1) + ' 秒'); }
     function bpsPercent(value) { return value == null ? '未知' : (Number(value) / 100).toFixed(4) + '%'; }
     function historyFields() {
-        return state.historyWindow === 604800
-            ? ['history_7d_samples', 'history_7d_min_bps', 'history_7d_max_bps', 'history_7d_avg_bps', '近7天']
-            : ['history_samples', 'history_min_bps', 'history_max_bps', 'history_avg_bps', '近24小时'];
+        if (state.historyWindow === 7776000) return ['history_target_samples', 'history_target_min_bps', 'history_target_max_bps', 'history_target_avg_bps', '近90天'];
+        if (state.historyWindow === 2592000) return ['history_target_samples', 'history_target_min_bps', 'history_target_max_bps', 'history_target_avg_bps', '近30天'];
+        if (state.historyWindow === 604800) return ['history_7d_samples', 'history_7d_min_bps', 'history_7d_max_bps', 'history_7d_avg_bps', '近7天'];
+        return ['history_samples', 'history_min_bps', 'history_max_bps', 'history_avg_bps', '近24小时'];
     }
     function updateHistoryWindowLabel() {
-        const label = state.historyWindow === 604800 ? '历史价差（7天）' : '历史价差（24h）';
+        const labels = {86400:'历史价差（24h）',604800:'历史价差（7天）',2592000:'历史价差（30天聚合）',7776000:'历史价差（90天聚合）'};
+        const label = labels[state.historyWindow] || labels[86400];
         const header = $('v2-history-header');
         if (header) header.textContent = label;
     }
+    function historyWindowLabel() {
+        return ({86400:'历史价差（24h）',604800:'历史价差（7天）',2592000:'历史价差（30天聚合）',7776000:'历史价差（90天聚合）'})[state.historyWindow] || '历史价差（24h）';
+    }
     function historyRange(row) {
         const [samplesKey, minKey, maxKey] = historyFields();
+        if (state.historyWindow > 604800 && Number(row.history_target_window_seconds) !== state.historyWindow) return '统计更新中';
         const samples = Number(row[samplesKey] || 0);
         if (!samples || row[minKey] == null || row[maxKey] == null) return '样本不足';
         return bpsPercent(row[minKey]) + ' ~ ' + bpsPercent(row[maxKey]);
     }
     function historyRangeDetail(row) {
         const [samplesKey, , , avgKey, label] = historyFields();
+        if (state.historyWindow > 604800 && Number(row.history_target_window_seconds) !== state.historyWindow) return '统计更新中';
         const samples = Number(row[samplesKey] || 0);
-        const rawSamples = Number(state.historyWindow === 604800 ? row.history_7d_raw_samples : row.history_raw_samples) || 0;
-        const anomalies = Number(state.historyWindow === 604800 ? row.history_7d_anomaly_count : row.history_anomaly_count) || 0;
+        const long = state.historyWindow > 604800;
+        const rawSamples = Number(long ? row.history_target_raw_samples : state.historyWindow === 604800 ? row.history_7d_raw_samples : row.history_raw_samples) || 0;
+        const anomalies = Number(long ? row.history_target_anomaly_count : state.historyWindow === 604800 ? row.history_7d_anomaly_count : row.history_anomaly_count) || 0;
         if (!samples) return rawSamples ? label + '采集到 ' + rawSamples + ' 个样本，但均被标为异常，暂不用于回归统计' : label + '暂无已采集的该路线价差样本';
         const anomalyNote = anomalies ? '；异常点 ' + anomalies + ' 个已从中心、均值和极值中排除' : '';
-        return label + '已采集 ' + samples + ' 个正常样本；平均 ' + bpsPercent(row[avgKey]) + anomalyNote + '。图表仍保留原始异常点，极值不代表可成交价格或未来一定回归。';
+        return label + (long ? '使用等时间间隔聚合代表值，极值与次数为近似；' : '') + '已采集 ' + samples + ' 个正常样本；平均 ' + bpsPercent(row[avgKey]) + anomalyNote + '。图表仍保留原始异常点，极值不代表可成交价格或未来一定回归。';
     }
     function spreadFilterAllowed(row) {
         const value = Math.abs(executionGross(row) ?? Number(row?.gross_bps));
@@ -487,7 +495,8 @@
         // display filters locally so a rejected counterpart stays explainable.
         return '&gross_min_bps=0&gross_max_bps=0' +
             '&target_mode=' + encodeURIComponent(state.reversionTargetMode) +
-            '&target_window_seconds=' + encodeURIComponent(state.reversionWindow);
+            '&target_window_seconds=' + encodeURIComponent(state.reversionWindow) +
+            '&history_window_seconds=' + encodeURIComponent(state.historyWindow);
     }
     function reversionKey(row) {
         return (row?.canonical_symbol || '') + '|' + row?.buy_venue + '->' + row?.sell_venue;
@@ -751,6 +760,53 @@
         if (timestamp == null) return '--';
         return new Date(Number(timestamp) * 1000).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
     }
+    function renderReversionQuality(root, stats) {
+        root.replaceChildren();
+        const note=document.createElement('p');note.className='chart-note';
+        if (!stats.quality_ready || stats.statistics_ready === false) {
+            note.textContent=stats.quality_reason || '回归质量统计正在后台计算…';root.appendChild(note);return;
+        }
+        const drift=chartNumber(stats.center_drift_bps)?stats.center_drift_bps.toFixed(2)+' bps':'样本不足';
+        note.textContent=`近期中心相对所选窗口偏移 ${drift}；有效样本 ${stats.samples} 个，覆盖 ${elapsedLabel(stats.sample_span_seconds)}。`;
+        root.appendChild(note);
+        const centers=document.createElement('p');centers.className='chart-note';
+        centers.textContent='近期中心：'+[['3600','1小时'],['21600','6小时'],['86400','24小时']]
+            .map(([key,label])=>`${label} ${Number(stats.recent_centers?.[key]?.samples||0)>=30?bpsPercent(stats.recent_centers[key].center_bps):'样本不足'}`).join(' · ');
+        root.appendChild(centers);
+        const wrap=document.createElement('div');wrap.className='reversion-event-table-wrap';wrap.setAttribute('tabindex','0');wrap.setAttribute('aria-label','上下沿回归质量统计，可横向滚动');
+        const table=document.createElement('table');table.className='reversion-event-table';
+        table.innerHTML='<thead><tr><th>触发侧</th><th>触边次数</th><th>24小时内回归 / 已完成观察</th><th>回归比例</th><th>典型回归耗时</th><th>24小时未回归</th><th>仍在等待</th><th>报价缺口中断</th></tr></thead>';
+        const body=document.createElement('tbody');
+        for(const side of ['upper','lower']) {
+            const s=stats.sides?.[side];if(!s)continue;
+            const row=document.createElement('tr');
+            [side==='upper'?'上沿':'下沿',s.entered,`${s.returned} / ${s.resolved}`,
+                chartNumber(s.return_rate)?(s.return_rate*100).toFixed(1)+'%':'暂无完成观察',
+                s.median_return_seconds==null?'--':elapsedLabel(s.median_return_seconds),
+                s.timed_out,s.pending,s.interrupted].forEach(value=>{
+                const cell=document.createElement('td');cell.textContent=String(value??'--');row.appendChild(cell);
+            });body.appendChild(row);
+        }
+        table.appendChild(body);wrap.appendChild(table);root.appendChild(wrap);
+        const b=stats.bounds||{},rule=document.createElement('p');rule.className='chart-note';
+        const p=stats.policy;
+        rule.textContent=`本次回看边界：${bpsPercent(b.lower_bps)} / ${bpsPercent(b.upper_bps)}，中心 ${bpsPercent(b.center_bps)}；目标：`+
+            (p?(p.exit_mode==='opposite'?'冻结对侧边界':`从触边报价向冻结中心回归 ${p.reversion_percent}%`):
+                ({zero:'0 ±2 bps',either:'最近有利的中心或0 ±2 bps',center:'中心 ±2 bps'}[stats.target_mode]))+
+            `。最近有效报价 ${eventTime(stats.last_sample_at)}。非通道模式的触发区域仅为历史分位诊断区，不代表实际入场门槛。`;
+        root.appendChild(rule);
+        const details=document.createElement('details'),summary=document.createElement('summary');summary.textContent='最近触边记录';details.appendChild(summary);
+        const labels={returned:'已回归',timed_out:'24小时未回归',pending:'仍在等待',interrupted:'报价缺口中断'};
+        const events=['upper','lower'].flatMap(side=>(stats.sides?.[side]?.recent_events||[]).map(e=>({...e,side})))
+            .sort((a,b)=>b.start_timestamp-a.start_timestamp).slice(0,20);
+        for(const e of events) {
+            const line=document.createElement('p');line.className='chart-note';
+            line.textContent=`${e.side==='upper'?'上沿':'下沿'} · ${eventTime(e.start_timestamp)} · ${bpsPercent(e.entry_bps)} → ${bpsPercent(e.target_bps)} · ${labels[e.status]||'未知'} · ${elapsedLabel(e.duration_seconds)}`;
+            details.appendChild(line);
+        }
+        root.appendChild(details);
+        const caveat=document.createElement('p');caveat.className='chart-note';caveat.textContent=stats.note;root.appendChild(caveat);
+    }
     function renderReversionDetails(root, stats) {
         root.replaceChildren();
         const details = document.createElement('details');
@@ -804,7 +860,7 @@
     const chartLineVisible = key => chartVisibility[key] !== false;
     const chartMarkKey = mark => ({'上边界':'upper','冻结上界':'upper','下边界':'lower','冻结下界':'lower',
         '通道中心':'center','冻结中心':'center','历史中心':'center','临时中心·样本待就绪':'center',
-        '本单冻结目标':'target','0':'zero','+回归带':'bandUpper','-回归带':'bandLower','P10':'p10','P90':'p90'})[mark.name];
+        '本单冻结目标':'target','预计出场':'target','原计划出场':'target','0':'zero','+回归带':'bandUpper','-回归带':'bandLower','P10':'p10','P90':'p90'})[mark.name];
     function chartLineControls(root, entries, redraw) {
         root._chartRedraw = redraw;
         const signature = entries.map(([key,label]) => key + ':' + label).join('|');
@@ -832,7 +888,7 @@
             for (const [label, all] of [['仅策略线', false], ['全部显示', true]]) {
                 const button = document.createElement('button'); button.type = 'button'; button.className = 'secondary compact-action'; button.textContent = label;
                 button.addEventListener('click', () => {
-                    for (const [key] of entries) chartVisibility[key] = all || ['spread','current','upper','lower','center','target'].includes(key);
+                    for (const [key] of entries) chartVisibility[key] = all || ['spread','reverse','current','entry','signal','upper','lower','center','target'].includes(key);
                     save();
                 });
                 actions.appendChild(button);
@@ -847,6 +903,17 @@
     function executionGross(row) {
         const a=row.buy_price, b=row.sell_price;
         return [a,b].every(v=>chartNumber(v)&&v>0) ? (b-a)/Math.max(a,b)*10000 : null;
+    }
+    function chartDirectionalQuotes(row, axis) {
+        const inputs=row.return_inputs||{}, forward=row.buy_venue===axis[0];
+        const a=forward?inputs.buy:inputs.sell, b=forward?inputs.sell:inputs.buy;
+        const aAsk=forward?row.buy_price:a?.ask, bBid=forward?row.sell_price:b?.bid;
+        const aBid=forward?a?.bid:row.sell_price, bAsk=forward?b?.ask:row.buy_price;
+        const spread=(buy,sell)=>[buy,sell].every(v=>chartNumber(v)&&v>0)?(sell-buy)/Math.max(buy,sell)*10000:null;
+        const validA=!(chartNumber(aBid)&&chartNumber(aAsk))||aBid<=aAsk;
+        const validB=!(chartNumber(bBid)&&chartNumber(bAsk))||bBid<=bAsk;
+        if (!validA||!validB) return {forward:null,reverse:null};
+        return {forward:spread(aAsk,bBid),reverse:spread(bAsk,aBid)};
     }
     function drawerChannelSpec(row, position) {
         const basis = window.StrategyChannelUI?.basis();
@@ -884,11 +951,23 @@
             else if (sameAxis(preview.channel) && chartNumber(preview.channel.entry_axis_bps))
                 current = preview.channel.entry_axis_bps;
         }
-        return {channel, current, frozen: Boolean(spec.frozen), axis: spec.axis, axisOnly:!spec.enabled,
+        const directional=fresh?chartDirectionalQuotes(row,spec.axis):{forward:null,reverse:null};
+        return {channel, current, reverseCurrent:directional.reverse==null?null:-directional.reverse,
+            directional, frozen: Boolean(spec.frozen), axis: spec.axis, axisOnly:!spec.enabled,
             directions:row.pair_directions || {[row.buy_venue===spec.axis[0]?'forward':'reverse']:row},
             side: spec.frozen?.side || (row.buy_venue === spec.axis[0] ? 'upper' : 'lower'),
             reason: !spec.frozen && basis && !matching ? '策略已更新，等待当前配置的通道估算' : preview.reason,
             estimateReady: matching && preview.target_mode === 'channel' && preview.meets_floor === true};
+    }
+    const channelDirection = side => side === 'upper' ? 'A多/B空' : 'B多/A空';
+    function channelBoundarySummary(context, side) {
+        const upper = side === 'upper', ch = context.channel;
+        const name = (upper ? '上沿 ' : '下沿 ') + channelDirection(side);
+        const boundary = ch?.[upper ? 'upper_bps' : 'lower_bps'];
+        if (!chartNumber(boundary)) return name + '：等待边界';
+        if (!chartNumber(context.current)) return name + '：等待报价';
+        const touched = upper ? context.current >= boundary : context.current <= boundary;
+        return name + '：' + (touched ? '已触边' : '距边 ' + Math.abs(boundary-context.current).toFixed(2) + ' bps');
     }
     function channelChartNote(context) {
         const ch = context.channel;
@@ -900,11 +979,41 @@
         if (context.frozen) return source + ' · ' + axis + ' · 当前 ' + context.current.toFixed(2) + ' bps；触线后仍须净盈利及平仓核验达标。';
         const upper = context.side === 'upper', boundary = ch[upper ? 'upper_bps' : 'lower_bps'];
         const touched = upper ? context.current >= boundary : context.current <= boundary;
-        if (!touched) return source + ' · ' + axis + ' · 距本方向' + (upper ? '上' : '下') + '边界 ' + Math.abs(boundary-context.current).toFixed(2) + ' bps。';
-        return source + ' · ' + axis + ' · 本方向已触边；只读估算：' +
+        const boundaryNote = source + ' · ' + axis + ' · ' + channelBoundarySummary(context, context.side);
+        if (!touched) return boundaryNote + '。';
+        const row = context.directions?.[upper ? 'forward' : 'reverse'];
+        const estimate = row ? refreshReversionEstimate(row) : null;
+        const net = estimate?.return_preview?.net_bps;
+        return boundaryNote + '；只读估算：' +
+            (chartNumber(net) ? '整轮净差 ' + net.toFixed(2) + ' bps，' : '') +
             (context.estimateReady ? '收益达标，仍待实盘复核（不代表已下单）' : context.reason || '等待同轮整轮收益估算') + '。';
     }
-    function renderReversionChart(root, history, stats, currentPoint = null, referenceHistory = [], frozenTarget = null, channelContext = null) {
+    function positionEntryPoint(position, channelContext) {
+        if (!position) return null;
+        // A rollback can retain the unsubmitted leg's planned price. Price
+        // fields alone therefore cannot prove a paired entry ever filled.
+        const sizes = [position.entry_size_variational ?? position.variational_size,
+                       position.entry_size_lighter ?? position.lighter_size];
+        if (!sizes.every(value => chartNumber(value) && value > 0)) return null;
+        const row = executionHistoryRow(position);
+        const buy = row.buy_price, sell = row.sell_price;
+        const timestamp = typeof position.open_time === 'number'
+            ? position.open_time * (position.open_time < 1e12 ? 1000 : 1) : Date.parse(position.open_time);
+        if (![buy,sell].every(value => chartNumber(value) && value > 0) || !Number.isFinite(timestamp) || timestamp <= 0) return null;
+        // Fills are observations, not a reconstruction of the opposite BBO.
+        // In a reverse channel trade use the actual A/B fill prices, without
+        // negating a directed spread or converting an already canonical value.
+        const forward = !channelContext || row.buy_venue === channelContext.axis?.[0];
+        const a = forward ? buy : sell, b = forward ? sell : buy;
+        return [timestamp, (b-a)/(channelContext ? Math.max(a,b) : buy)*10000];
+    }
+    function positionSignalPoint(position, channelContext) {
+        if (!position || !channelContext) return null;
+        const target = position.entry_target;
+        const value = target?.channel?.entry_axis_bps, timestamp = Date.parse(target?.frozen_at);
+        return chartNumber(value) && Number.isFinite(timestamp) && timestamp > 0 ? [timestamp,value] : null;
+    }
+    function renderReversionChart(root, history, stats, currentPoint = null, referenceHistory = [], frozenTarget = null, channelContext = null, position = null, reverseHistory = []) {
         let zoomState = null;
         if (reversionChartInstance) {
             const previous = reversionChartInstance.getOption?.()?.dataZoom;
@@ -918,7 +1027,18 @@
         const axisValue = value => channelContext && value > 0 ? value / (1 + value / 10000) : value;
         const points = (Array.isArray(history) ? history : []).filter(item => item.timestamp != null && chartNumber(item.gross_bps))
             .map(item => ({...item, gross_bps:axisValue(item.gross_bps)}));
-        if (!window.echarts || (!points.length && !currentPoint)) {
+        // Each reverse observation is an actual B-ask/A-bid quote. Negate
+        // ONLY that direction's own spread to place it on the fixed A/B axis.
+        const reversePoints=channelContext?(Array.isArray(reverseHistory)?reverseHistory:[])
+            .filter(item=>item.timestamp!=null).map(item=>({...item,
+                gross_bps:chartNumber(item.gross_bps)&&item.valid_for_center!==false&&item.anomalous!==true
+                    ?-axisValue(item.gross_bps):null})):[];
+        const entryPoint = positionEntryPoint(position, channelContext);
+        const signalPoint = positionSignalPoint(position, channelContext);
+        const unpaired = position && (position.entry_rollback_recorded || position.rollback_category ||
+            position.entry_size_variational > 0 && position.entry_size_lighter === 0);
+        const exitLabel = unpaired ? '原计划出场' : '预计出场';
+        if (!window.echarts || (!points.length && !currentPoint && !entryPoint && !signalPoint)) {
             disposeReversionChart(); root.replaceChildren();
             root.textContent = (!window.echarts ? '图表资源未加载；下方表格仍可查看回归明细。' : '暂无足够的历史价差样本绘图。') +
                 (channelContext ? ' ' + channelChartNote(channelContext) : '');
@@ -938,71 +1058,154 @@
         const p90 = chartNumber(stats.p90_bps) ? statsValue(stats.p90_bps) : null;
         const normalPoints = points.filter(item => item.anomalous !== true && item.valid_for_center !== false);
         const anomalyPoints = points.filter(item => item.anomalous === true);
-        const values = normalPoints.map(item => [Number(item.timestamp) * 1000, Number(item.gross_bps)]);
         const currentValue = currentPoint && Number.isFinite(Number(currentPoint.gross_bps)) ? Number(currentPoint.gross_bps) : null;
         const currentTimestamp = currentPoint && Number.isFinite(Number(currentPoint.timestamp)) ? Number(currentPoint.timestamp) * 1000 : null;
-        if (currentValue != null && currentTimestamp != null) values.push([currentTimestamp, currentValue]);
+        const reverseCurrent=chartNumber(channelContext?.reverseCurrent)?channelContext.reverseCurrent:null;
+        const reverseTimestamp=currentTimestamp??(reverseCurrent==null?null:Date.now());
+        const reverseMap=new Map(reversePoints.map(item=>[Number(item.timestamp)*1000,item.gross_bps]));
+        // Missing reverse samples stay missing; the forward line never fills
+        // them in. Both traces use the same time axis and no extra quote I/O.
+        for(const item of points) if(!reverseMap.has(Number(item.timestamp)*1000))reverseMap.set(Number(item.timestamp)*1000,null);
+        if(reverseCurrent!=null&&reverseTimestamp!=null)reverseMap.set(reverseTimestamp,reverseCurrent);
+        const reverseValues=Array.from(reverseMap).sort((a,b)=>a[0]-b[0]);
         const anomalyValues = anomalyPoints.map(item => [Number(item.timestamp) * 1000, Number(item.gross_bps)]);
         const referenceValues = (Array.isArray(referenceHistory) ? referenceHistory : [])
             .filter(item => item.timestamp != null && item.reference_bps != null)
             .map(item => [Number(item.timestamp) * 1000, axisValue(Number(item.reference_bps))]);
         const channel = channelContext?.channel;
+        const touches = channel?.touch_statistics;
+        const touchZones = ['upper','lower'].flatMap(side => {
+            const zone=touches?.[side];
+            return zone ? [{side,zone,color:side==='upper'?'#e9ad70':'#8ca6ff'}] : [];
+        });
+        // History is thinned by the API, while confirmed touches retain the
+        // original samples. Restore those anchors in the same execution axis
+        // even when their scatter overlay is hidden. No extra history read.
+        const linePoints = new Map(normalPoints.map(item => [Number(item.timestamp)*1000, Number(item.gross_bps)]));
+        const touchPoints = zone => (zone.points || [])
+            .filter(p => chartNumber(p.timestamp) && chartNumber(p.value_bps))
+            .map(p => [Number(p.timestamp)*1000, Number(p.value_bps)]);
+        for (const {zone} of touchZones) {
+            for (const [stamp,value] of touchPoints(zone)) linePoints.set(stamp,value);
+        }
+        if (currentValue != null && currentTimestamp != null) linePoints.set(currentTimestamp,currentValue);
+        const values = Array.from(linePoints).sort((a,b) => a[0]-b[0]);
         const marks = channelContext && !channelContext.axisOnly ? [
             ...(channel ? [
-                {yAxis:channel.upper_bps, name:channelContext.frozen?'冻结上界':'上边界', lineStyle:{color:'#e9ad70',type:'dashed',width:1.5}},
-                {yAxis:channel.lower_bps, name:channelContext.frozen?'冻结下界':'下边界', lineStyle:{color:'#8ca6ff',type:'dashed',width:1.5}},
+                {yAxis:channel.upper_bps, name:channelContext.frozen?'冻结上界':'上边界', direction:channelDirection('upper'), lineStyle:{color:'#e9ad70',type:'dashed',width:1.5}},
+                {yAxis:channel.lower_bps, name:channelContext.frozen?'冻结下界':'下边界', direction:channelDirection('lower'), lineStyle:{color:'#8ca6ff',type:'dashed',width:1.5}},
                 {yAxis:channel.center_bps, name:channelContext.frozen?'冻结中心':'通道中心', lineStyle:{color:'#f0bd62',type:'solid'}},
                 ...(channelContext.frozen && chartNumber(channel.exit_axis_bps) ? [{yAxis:channel.exit_axis_bps,name:'本单冻结目标',lineStyle:{color:'#ff879b',type:'dashed',width:1.6},label:{position:'insideStartTop'}}] : [])
             ] : []),
             ...(channel && Math.abs(channel.center_bps) < 1e-9 ? [] : [{yAxis:0,name:'0',lineStyle:{color:'#314762',type:'solid'}}])
-        ].map(mark=>({...mark,label:{position:'insideEndTop',...mark.label,formatter:()=>mark.name+' '+mark.yAxis.toFixed(2)+' bps',color:mark.lineStyle.color}})) : null;
-        const allMarks = marks || [
+        ].map(mark=>({...mark,caption:mark.name+(mark.direction?' · '+mark.direction:''),
+            label:{position:'insideEndTop',...mark.label,
+                formatter:()=>mark.name+(mark.direction?' · '+mark.direction:'')+' '+mark.yAxis.toFixed(2)+' bps',color:mark.lineStyle.color}})) : null;
+        const allMarks = (marks || [
             ...(center == null ? [] : [{ yAxis: center, name: stats.center_ready === false ? '临时中心·样本待就绪' : '历史中心', lineStyle: { color: '#f0bd62', type: 'solid', width: 1.2 } }]),
             ...(Number.isFinite(frozenTarget) ? [{ yAxis: frozenTarget, name: '本单冻结目标', label: {position:'insideStartTop',formatter:'本单冻结目标 {c} bps',color:'#ff879b'}, lineStyle: { color: '#ff879b', type: 'dashed', width: 1.6 } }] : []),
             { yAxis: 0, name: '0', lineStyle: { color: '#314762', type: 'solid' } },
             ...(center == null ? [] : [{ yAxis: center + band, name: '+回归带' }, { yAxis: center - band, name: '-回归带' }]),
             ...(p10 == null ? [] : [{ yAxis: p10, name: 'P10', lineStyle: { color: '#8fa6c0', type: 'dotted' } }]),
             ...(p90 == null ? [] : [{ yAxis: p90, name: 'P90', lineStyle: { color: '#8fa6c0', type: 'dotted' } }]),
-        ];
-        const entries = [['spread','盘口价差'], ['current','当前报价点'],
-            ...allMarks.map(mark => [chartMarkKey(mark), mark.name === '0' ? '零轴' : mark.name]),
+        ]).map(mark => position && mark.name === '本单冻结目标' ? {...mark, name:exitLabel, caption:exitLabel,
+            label:{...mark.label, formatter:()=> exitLabel+' '+mark.yAxis.toFixed(2)+' bps'}} : mark);
+        const entries = [['spread',channelContext?'A买 / B卖 · '+(channelContext.axisOnly?'盘口':'判断线'):'盘口价差'],
+            ...(channelContext?[['reverse','B买 / A卖 · 对照线']]:[]), ['current','当前报价点'],
+            ...(entryPoint ? [['entry','入场成交点']] : []),
+            ...(signalPoint ? [['signal','计划报价点']] : []),
+            ...allMarks.map(mark => [chartMarkKey(mark), mark.name === '0' ? '零轴' : mark.caption || mark.name]),
             ...(anomalyValues.length ? [['anomalies','异常点']] : []),
             ...(referenceValues.length ? [['reference','K 线参考']] : []),
+            ...(touchZones.length ? [['touches','触碰区间与历史触点']] : []),
             ...(!channelContext && stats.events?.length ? [['events','偏离区间阴影']] : [])];
-        chartLineControls(root, entries, () => renderReversionChart(root, history, stats, currentPoint, referenceHistory, frozenTarget, channelContext));
+        chartLineControls(root, entries, () => renderReversionChart(root, history, stats, currentPoint, referenceHistory, frozenTarget, channelContext, position, reverseHistory));
         const compact = host.clientWidth > 0 && host.clientWidth < 420;
+        // ECharts markLine does not expand the value axis. Keep the held
+        // position's visible targets in view, even without recent quotes.
+        const visibleLevels = allMarks.filter(mark => chartLineVisible(chartMarkKey(mark)) && chartNumber(mark.yAxis)).map(mark => mark.yAxis);
+        const positionExtent = (extent, upper) => {
+            const levels = [extent.min,extent.max,...visibleLevels].filter(chartNumber);
+            if (!levels.length) return upper ? 1 : -1;
+            const low = Math.min(...levels), high = Math.max(...levels);
+            const padding = Math.max((high-low)*0.08,0.5);
+            return upper ? high+padding : low-padding;
+        };
         reversionChartInstance.setOption({
             animation: false,
             // Reserve room for the y-axis and the end labels of the reference
             // lines.  With a narrow right margin ECharts clips the last digit.
             grid: { left: compact ? 22 : 50, right: compact ? 46 : 76, top: 28, bottom: 54, containLabel: true },
-            tooltip: { trigger: 'axis', renderMode:'richText', valueFormatter: value => bpsPercent(value), axisPointer: { type: 'cross' },
+            tooltip: { trigger: 'axis', renderMode:'richText', confine:true,
+                textStyle:{fontSize:compact?10:12,lineHeight:compact?14:18},
+                valueFormatter: value => bpsPercent(value), axisPointer: { type: 'cross' },
                 formatter: params => {
                     const visible = params.filter(p => p.seriesIndex !== 0 || chartLineVisible('spread'));
                     const point = visible.find(p => p.seriesIndex===0) || visible[0], value=point?.value;
                     if (!Array.isArray(value)) return '';
-                    let text = new Date(value[0]).toLocaleTimeString('zh-CN',{hour12:false})+'\n'+(point.seriesIndex===0?'固定 A/B 价差 ':point.seriesName+' ')+Number(value[1]).toFixed(2)+' bps';
-                    if (point.seriesIndex===0 && channelContext && value[0]===currentTimestamp) {
+                    const format=v=>chartNumber(v)?v.toFixed(2)+' bps':'未知';
+                    let text = new Date(value[0]).toLocaleTimeString('zh-CN',{hour12:false})+'\n'+(point.seriesIndex===0?'固定 A/B 价差 ':point.seriesName+' ')+format(value[1]);
+                    if (channelContext && (value[0]===currentTimestamp||value[0]===reverseTimestamp)) {
+                        if (channel && !channelContext.axisOnly && !channelContext.frozen)
+                            text+='\n'+(compact?'':'按绿线判断触边 · ')+channelBoundarySummary(channelContext,'upper')+'\n'+channelBoundarySummary(channelContext,'lower');
                         for (const [side,label] of [['forward','A买 / B卖'],['reverse','B买 / A卖']]) {
                             const row=channelContext.directions?.[side], current=row ? refreshReversionEstimate(row) : null;
-                            text+='\n'+label+'：'+netBps(current)+(current ? ' · '+opportunityStatus(current.return_preview||{}) : ' · 等待本方向报价');
+                            const separator=compact?'\n':' · ';
+                            text+='\n'+label+'：毛价差 '+format(channelContext.directional?.[side])+separator+'整轮净差 '+netBps(current)+
+                                (current ? separator+opportunityStatus(current.return_preview||{}) : separator+'等待本方向估算');
                         }
-                    } else text+='\n历史报价点；双向整轮收益仅展示当前同轮估算';
-                    return text;
+                        if(!compact&&chartNumber(channelContext.directional?.forward)&&chartNumber(channelContext.directional?.reverse))
+                            text+='\n双边买卖点差影响 '+format(-channelContext.directional.reverse-channelContext.directional.forward);
+                    } else {
+                        if(channelContext){
+                            const forward=points.find(item=>Number(item.timestamp)*1000===value[0]&&item.valid_for_center!==false&&item.anomalous!==true);
+                            const reverse=reversePoints.find(item=>Number(item.timestamp)*1000===value[0]);
+                            text+='\nA买 / B卖：毛价差 '+format(forward?.gross_bps)+
+                                '\nB买 / A卖：毛价差 '+format(chartNumber(reverse?.gross_bps)?-reverse.gross_bps:null);
+                        }
+                        text+='\n历史报价点；双向整轮收益仅展示当前同轮估算';
+                    }
+                    if(channelContext)text+=compact?'\n绿线判触边；紫线仅对照'
+                        :'\n紫线仅作对照，不判断触边；反向毛价差与紫线纵轴值符号相反';
+                    return compact?text.split('\n').map(line=>line.match(/.{1,26}/gu)?.join('\n')||'').join('\n'):text;
                 } },
             xAxis: { type: 'time', splitNumber:compact ? 3 : 6, axisLabel: { color: '#8195ad', fontSize: 9, hideOverlap:true, formatter: value => { const date = new Date(value); const pad = n => String(n).padStart(2, '0'); return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`; } }, axisLine: { lineStyle: { color: '#314762' } } },
-            yAxis: { type: 'value', name: 'bps', nameTextStyle: { color: '#8195ad', fontSize: 9 }, axisLabel: { color: '#8195ad', fontSize: 9, formatter: value => Number(value).toFixed(1) }, splitLine: { lineStyle: { color: '#1e3046' } } },
+            yAxis: { type: 'value', name: 'bps', ...(position||channelContext&&channel ? {min:extent=>positionExtent(extent,false),max:extent=>positionExtent(extent,true)} : {}), nameTextStyle: { color: '#8195ad', fontSize: 9 }, axisLabel: { color: '#8195ad', fontSize: 9, formatter: value => Number(value).toFixed(1) }, splitLine: { lineStyle: { color: '#1e3046' } } },
             dataZoom: zoomState || [{ type: 'inside', filterMode: 'none' }, { type: 'slider', height: 16, bottom: 10, borderColor: '#314762', backgroundColor: '#0b1726', fillerColor: '#285349', handleStyle: { color: '#55d9ba' }, textStyle: { color: '#8195ad', fontSize: 9 } }],
             // Retain invisible anchor observations so ECharts still lays out
             // standalone strategy marks when the price/reference curves are hidden.
-            series: [{ type: 'line', name: '正常价差', showSymbol: false, smooth: false,
+            series: [{ type: 'line', name: channelContext?'A买 / B卖 · '+(channelContext.axisOnly?'盘口':'判断线'):'正常价差', showSymbol: false, smooth: false,
                 lineStyle: { color: '#55d9ba', width: 1.5, opacity: chartLineVisible('spread') ? 1 : 0 },
                 emphasis: {disabled: !chartLineVisible('spread')}, itemStyle: { color: '#55d9ba' }, data: values,
                 markLine: { silent: true, symbol: 'none', label: { show: true, position: 'end', distance: 8, color: '#b6c4d5', fontSize: 9 }, lineStyle: { color: '#657b91', type: 'dashed' }, data: allMarks.filter(mark => chartLineVisible(chartMarkKey(mark))) },
-                markArea: { silent: true, itemStyle: { color: '#e6b45e12' }, data: (channelContext || !chartLineVisible('events') ? [] : stats.events || []).map(event => [{ xAxis: Number(event.start_timestamp == null ? event.timestamp : event.start_timestamp) * 1000 }, { xAxis: Number(event.timestamp) * 1000 }]) },
-                markPoint: currentValue == null || !chartLineVisible('current') ? undefined : { silent: true, symbol: 'circle', symbolSize: 8, itemStyle: { color: '#f0bd62' }, label: { show: true, formatter: '当前', position:'right', color: '#f0bd62', fontSize: 9 }, data: [{ coord: [currentTimestamp, currentValue] }] },
-            }, ...(anomalyValues.length && chartLineVisible('anomalies') ? [{ type: 'scatter', name: '异常点（不计入回归）', symbolSize: 8, itemStyle: { color: '#ff879b', borderColor: '#fff0f3', borderWidth: 1 }, data: anomalyValues }] : []),
-                ...(referenceValues.length && chartLineVisible('reference') ? [{ type: 'line', name: '交易所历史参考价差（K线）', showSymbol: false, smooth: false, lineStyle: { color: '#8da9f2', width: 1.2, type: 'dashed' }, itemStyle: { color: '#8da9f2' }, data: referenceValues }] : [])],
+                markArea: { silent: true, itemStyle: { color: '#e6b45e12' }, data: [
+                    ...(channelContext || !chartLineVisible('events') ? [] : stats.events || []).map(event => [{ xAxis: Number(event.start_timestamp == null ? event.timestamp : event.start_timestamp) * 1000 }, { xAxis: Number(event.timestamp) * 1000 }]),
+                    ...(chartLineVisible('touches') ? touchZones.map(({side,zone,color})=>[
+                        {name:(side==='upper'?'上沿':'下沿')+' · '+zone.count+' 次独立触碰',yAxis:zone.low_bps,
+                            itemStyle:{color:color+'18'},label:{color,fontSize:9}}, {yAxis:zone.high_bps}]) : [])] },
+                markPoint: currentValue == null || !chartLineVisible('current') ? undefined : { silent: true, symbol: 'circle', symbolSize: 8, itemStyle: { color: '#f0bd62' },
+                    label: { show: true, formatter:channel && !channelContext.frozen && !channelContext.axisOnly
+                        ? currentValue >= channel.upper_bps ? '上沿触边' : currentValue <= channel.lower_bps ? '下沿触边' : '当前'
+                        : '当前', position:'right', color: '#f0bd62', fontSize: 9 }, data: [{ coord: [currentTimestamp, currentValue] }] },
+            }, ...(channelContext&&chartLineVisible('reverse')?[{type:'line',name:'B买 / A卖 · 反向映射',showSymbol:false,smooth:false,
+                connectNulls:false,lineStyle:{color:'#c49bff',type:'dashed',width:1.5},itemStyle:{color:'#c49bff'},data:reverseValues,
+                markPoint:reverseCurrent==null||!chartLineVisible('current')?undefined:{silent:true,symbol:'circle',symbolSize:7,
+                    itemStyle:{color:'#c49bff'},label:{show:false},data:[{coord:[reverseTimestamp,reverseCurrent]}]}}]:[]),
+                ...(entryPoint && chartLineVisible('entry') ? [{type:'scatter', name:'入场成交点', symbol:'diamond',symbolSize:13,z:8,
+                itemStyle:{color:'#8da9f2',borderColor:'#dce5ff',borderWidth:1.5},
+                label:{show:true,position:'top',formatter:()=> '入场 '+entryPoint[1].toFixed(2)+' bps',color:'#b9caff',fontSize:10},
+                tooltip:{trigger:'item',formatter:()=> '入场成交点 '+entryPoint[1].toFixed(2)+' bps\n开仓记录时间：'+new Date(entryPoint[0]).toLocaleString('zh-CN',{hour12:false})+'\n按双腿成交均价计算；与折线的盘口报价可能不同。'},
+                data:[entryPoint]}] : []),
+                ...(signalPoint && chartLineVisible('signal') ? [{type:'scatter',name:'计划报价点',symbol:'triangle',symbolSize:12,z:7,
+                    itemStyle:{color:'#e9ad70'},label:{show:true,position:'bottom',color:'#e9ad70',fontSize:10,
+                        formatter:()=> '计划 '+signalPoint[1].toFixed(2)+' bps'},data:[signalPoint],
+                    tooltip:{trigger:'item',formatter:()=> '计划报价 '+signalPoint[1].toFixed(2)+' bps\n'+
+                        new Date(signalPoint[0]).toLocaleString('zh-CN',{hour12:false})+'\n计划冻结时的 A/B 盘口价差，非成交价；不是首次穿越边界的时间。'}}] : []),
+                ...(anomalyValues.length && chartLineVisible('anomalies') ? [{ type: 'scatter', name: '异常点（不计入回归）', symbolSize: 8, itemStyle: { color: '#ff879b', borderColor: '#fff0f3', borderWidth: 1 }, data: anomalyValues }] : []),
+                ...(referenceValues.length && chartLineVisible('reference') ? [{ type: 'line', name: '交易所历史参考价差（K线）', showSymbol: false, smooth: false, lineStyle: { color: '#8da9f2', width: 1.2, type: 'dashed' }, itemStyle: { color: '#8da9f2' }, data: referenceValues }] : []),
+                ...(chartLineVisible('touches') ? touchZones.map(({side,zone,color})=>({type:'scatter',
+                    name:(side==='upper'?'上沿独立触点':'下沿独立触点')+' · '+channelDirection(side),symbolSize:6,itemStyle:{color},
+                    data:touchPoints(zone)})) : [])],
         }, {notMerge:true,lazyUpdate:true});
         if (!root._chartHelp || root._chartHelp.parentNode !== root) {
             const help = document.createElement('details'); help.className='desk-disclosure';
@@ -1013,10 +1216,16 @@
             root._chartHelp=help; root._chartLegend=legend; root._chartNote=note;
         }
         root._chartLegend.textContent = channelContext
-            ? '绿色为固定 A Ask / B Bid 坐标的盘口毛价差：(B Bid − A Ask) / max(A Ask, B Bid) × 10000；未扣费用，不代表指定数量可成交。上边界方向为买 A 卖 B，下边界方向为买 B 卖 A，反向不是简单取负。边界直接复用后台执行模型，持仓使用入场冻结值。蓝色虚线为 K 线参考，不用于判断触边。滚轮、底部滑块可缩放；拖动可平移。'
+            ? (channelContext.axisOnly ? '绿线为 A买/B卖盘口价差。' : '上沿对应 A多/B空，下沿对应 B多/A空，均按绿线判断触边；已有持仓沿用冻结边界与目标。') +
+                '紫虚线为反向真实价差在 A/B 坐标上的映射，仅作对照。悬浮查看双向实际毛价差及当前整轮净差；触边后仍须本方向收益和实盘核验达标。历史点不展示当前净收益；反向缺失样本留空。'
             : '横轴显示到秒；滚轮或底部滑块可缩放，拖动图表可平移。绿色线按买入 Ask、卖出 Bid 绘制毛价差，未扣整轮成本，也不代表指定数量可成交；蓝色虚线是交易所 K 线收盘价重建的参考价差（不可执行）。红点是异常价差（保留显示但不计入统计），黄色点是最近一次实时毛价差。中心、分位线和回归带都不是实盘入场门槛，入场需核验整轮净收益。阴影表示价差偏离持续区间。';
         root._chartNote.textContent = channelContext ? channelChartNote(channelContext)
             : '盘口毛价差未扣费用；触线后仍须净盈利及平仓核验达标。';
+        if (position) {
+            root._chartLegend.textContent += ' 三角为冻结计划报价，菱形只表示双腿实际成交。冻结边界不能还原此前每个时刻的动态边界。';
+            root._chartNote.textContent += unpaired ? ' 本单未成对：显示计划报价，不拼接参考价冒充双腿成交；出场线仅为原计划。'
+                : ' 菱形为双腿成交均价；预计出场线为本单冻结目标，仍须净盈利及平仓核验达标。';
+        }
     }
     function executionHistoryRow(position) {
         const firstVenue = position?.variational_venue || 'variational';
@@ -1065,6 +1274,7 @@
         const metricNodes = new Map();
         const grid = document.createElement('div'); grid.className = 'drawer-metrics';
         const history = row.history_position;
+        let chartPosition = history;
         const valuationNote = document.createElement('p'); valuationNote.className = 'chart-note drawer-valuation-note';
         const valuationText = position => (position.mark_note || '浮动盈亏按双腿盘口中间价估算，已扣已知入场手续费，未扣未来平仓费和待结算资金费。') +
             ' ' + (globalThis.positionMonitorRowText?.(position.position_monitor) || '') + ' ' +
@@ -1087,17 +1297,17 @@
             ? '黄线是当前历史中心；粉色虚线是本单开仓时冻结的回归目标 ' + spreadText(history.entry_target.target_bps) + '。折线按原开仓方向的 Ask / Bid 绘制；平仓方向相反，还须通过实际平仓净盈利核验。'
             : '黄线是当前历史中心；折线按原开仓方向的 Ask / Bid 绘制。到达历史中心仍须核验反向平仓的可成交净收益。';
         const openMonitorStatus = position => !position.position_monitor ? '未平仓 · 监控心跳待接入' : position.position_monitor.heartbeat_stale ? '未平仓 · 监控心跳中断' : position.position_monitor.error ? '未平仓 · 平仓判断受阻' : position.position_monitor.account_status === 'pending' ? '未平仓 · 账户核验中' : '未平仓 · 持仓监控中';
-        const historyStatus = history ? (history.hedge_status === 'single_leg_recovered' && historyClosed ? '已回补 · 未成对' : historyClosed ? (history.accounting_pending ? '已平仓 · 待核账' : '已平仓') : history.partially_closed ? '部分已平仓 · 待核对' : history.status === 'reconcile_required' ? '待核对 · 持仓复核受阻' : openMonitorStatus(history)) : null;
+        const historyStatus = history ? (history.hedge_status === 'single_leg_recovered' && historyClosed ? '已回补 · 未成对' : historyClosed ? (history.accounting_pending && !Number.isFinite(history.provisional_pnl_usdc) ? '已平仓 · 待核账' : '已平仓') : history.partially_closed ? '部分已平仓 · 待核对' : history.status === 'reconcile_required' ? '待核对 · 持仓复核受阻' : openMonitorStatus(history)) : null;
         const metrics = [
-            ...(history ? [['执行状态', historyStatus], [historyClosed?'开仓数量（两腿）':'持仓数量（两腿）', (historyClosed ? (history.entry_size_variational ?? history.variational_size) : history.variational_size) + ' / ' + (historyClosed ? (history.entry_size_lighter ?? history.lighter_size) : history.lighter_size)], ['实际入场价差', spreadText(history.actual_entry_spread_bps)], ...(historyClosed ? [['平仓价（两腿）', (history.close_price_variational == null ? '--' : Number(history.close_price_variational).toLocaleString('en-US', {maximumFractionDigits: 8})) + ' / ' + (history.close_price_lighter == null ? '--' : Number(history.close_price_lighter).toLocaleString('en-US', {maximumFractionDigits: 8}))]] : []), [historyClosed ? '平仓价差' : '当前价差', !historyClosed && !Number.isFinite(history.current_spread_bps) ? (history.mark_error||'行情待更新') : spreadText(historyClosed ? history.close_spread_bps : history.current_spread_bps)], [historyClosed ? '净盈亏' : '浮动盈亏（估算）', historyClosed ? (history.realized_pnl_usdc == null ? (Number.isFinite(history.accounting_subtotal_usdc) ? '暂计 '+Number(history.accounting_subtotal_usdc).toFixed(6)+' U' : '缺成交明细') : Number(history.realized_pnl_usdc).toFixed(6) + ' U') : (history.unrealized_pnl_usdc == null ? (history.pnl_error||history.mark_error||'行情待更新') : Number(history.unrealized_pnl_usdc).toFixed(4) + ' U')]] : []),
+            ...(history ? [['执行状态', historyStatus], [historyClosed?'开仓数量（两腿）':'持仓数量（两腿）', (historyClosed ? (history.entry_size_variational ?? history.variational_size) : history.variational_size) + ' / ' + (historyClosed ? (history.entry_size_lighter ?? history.lighter_size) : history.lighter_size)], ['实际入场价差', spreadText(history.actual_entry_spread_bps)], ...(historyClosed ? [['平仓价（两腿）', (history.close_price_variational == null ? '--' : Number(history.close_price_variational).toLocaleString('en-US', {maximumFractionDigits: 8})) + ' / ' + (history.close_price_lighter == null ? '--' : Number(history.close_price_lighter).toLocaleString('en-US', {maximumFractionDigits: 8}))]] : []), [historyClosed ? '平仓价差' : '当前价差', !historyClosed && !Number.isFinite(history.current_spread_bps) ? (history.mark_error||'行情待更新') : spreadText(historyClosed ? history.close_spread_bps : history.current_spread_bps)], [historyClosed ? '净盈亏' : '浮动盈亏（估算）', historyClosed ? (history.realized_pnl_usdc == null ? (Number.isFinite(history.provisional_pnl_usdc ?? history.accounting_subtotal_usdc) ? '暂计 '+Number(history.provisional_pnl_usdc ?? history.accounting_subtotal_usdc).toFixed(6)+' U' : '缺成交明细') : Number(history.realized_pnl_usdc).toFixed(6) + ' U') : (history.unrealized_pnl_usdc == null ? (history.pnl_error||history.mark_error||'行情待更新') : Number(history.unrealized_pnl_usdc).toFixed(4) + ' U')]] : []),
             ...(history?.entry_target ? [['本单冻结目标',spreadText(history.entry_target.target_bps)]] : []),
             ...(history && !historyClosed ? [['持仓监控',globalThis.positionMonitorBrief?.(history.position_monitor)||'持仓监控心跳待接入'],['平仓净收益估算',exitMetrics(history).pnl],['平仓判断',exitMetrics(history).state]] : []),
             ...(historyClosed ? [['本单剩余数量（两腿）','0 / 0'],['成交来源',history.history_recovered?'平台历史成交与已确认回执自动补齐':'程序回执 / 平台历史'],['平仓时间（各腿）',Object.entries(history.close_fill_times||{}).map(([leg,stamp])=>venueShort(history[leg+'_venue'])+' '+new Date(stamp).toLocaleString('zh-CN',{hour12:false})+(history.close_fill_time_sources?.[leg]==='receipt_received'?'（回执收到时间）':'')).join(' / ')||'待补']] : []),
             ...(historyClosed && Number.isFinite(history.gross_price_pnl_usdc) ? [
                 ['成交价差盈亏', Number(history.gross_price_pnl_usdc).toFixed(6)+' U'],
-                ['已核验手续费', Number(history.known_fees_usdc).toFixed(6)+' U'],
+                [Number.isFinite(history.provisional_fees_usdc) ? '手续费合计（含暂计）' : '已核验手续费', Number(history.provisional_fees_usdc ?? history.known_fees_usdc).toFixed(6)+' U'],
                 ['已核验资金费', Number(history.known_funding_usdc).toFixed(6)+' U'],
-                ['核账说明', history.accounting_note||'费用与资金费已完整核算']
+                ['核账说明', history.provisional_accounting_note||history.accounting_note||'费用与资金费已完整核算']
             ] : []),
             ['买入 Ask', row.buy_price == null ? '--' : Number(row.buy_price).toLocaleString('en-US', { maximumFractionDigits: 8 })],
             ['卖出 Bid', row.sell_price == null ? '--' : Number(row.sell_price).toLocaleString('en-US', { maximumFractionDigits: 8 })],
@@ -1149,10 +1359,11 @@
                 if (!current) return;
                 if ((current.status === 'closed') !== Boolean(historyClosed)) { openHistoryDrawer(current); return; }
                 if (historyClosed) {
-                    const fields=['realized_pnl_usdc','accounting_subtotal_usdc','accounting_pending','close_spread_bps','close_price_variational','close_price_lighter','accounting_note','rollback_explanation','close_diagnostics'];
+                    const fields=['provisional_pnl_usdc','provisional_fees_usdc','provisional_accounting_note','fee_estimates','realized_pnl_usdc','accounting_subtotal_usdc','accounting_pending','close_spread_bps','close_price_variational','close_price_lighter','accounting_note','rollback_explanation','close_diagnostics'];
                     if(fields.some(key=>JSON.stringify(current[key])!==JSON.stringify(history[key])))openHistoryDrawer(current);
                     return;
                 }
+                chartPosition = current;
                 const reason = current.mark_error || '行情待更新';
                 closeDiagnostic.textContent = current.close_diagnostics?.text || '尚无已记录的平仓评估。';
                 const last = current.last_estimate;
@@ -1181,11 +1392,14 @@
         if (history && !historyClosed) calculation.appendChild(valuationNote);
         const reversion = document.createElement('p');
         reversion.className = 'chart-note drawer-wear';
-        reversion.textContent = '正在读取近 7 天回归统计…';
+        reversion.textContent = '正在读取近 ' + (state.reversionWindow / 86400) + ' 天回归统计…';
         const reversionContainer = document.createElement('details'); reversionContainer.className='desk-disclosure';
         const label = document.createElement('summary'); label.textContent='历史回归统计';
         reversionContainer.appendChild(label); body.appendChild(reversionContainer);
         reversionContainer.appendChild(reversion);
+        const qualityContainer=document.createElement('details');qualityContainer.className='desk-disclosure drawer-quality';
+        const qualityTitle=document.createElement('summary');qualityTitle.textContent='回归质量（仅统计）';qualityContainer.appendChild(qualityTitle);
+        const qualityRoot=document.createElement('div');qualityRoot.setAttribute('aria-live','polite');qualityContainer.appendChild(qualityRoot);body.appendChild(qualityContainer);
         const reversionChart = document.createElement('div');
         reversionChart.className = 'drawer-reversion-chart';
         reversionChart.textContent = '正在读取历史价差曲线…';
@@ -1201,7 +1415,7 @@
         reversionContainer.appendChild(reversionDetails);
         const requestId = ++drawerRequestId;
         let quoteRevision = 0, lastStreamQuoteAt = 0, drawerQuoteRow = row;
-        let liveHistory = [], liveStats = channelSpec.enabled ? {} : null, liveReference = [], lastHistoryRefreshAt = Date.now(), lastChartPaintAt = 0;
+        let liveHistory = [], liveReverseHistory = [], liveStats = history || channelSpec.enabled ? {} : null, liveReference = [], lastHistoryRefreshAt = Date.now(), lastChartPaintAt = 0;
         let liveChannel = drawerChannelState(row, channelSpec);
         let liveCurrent = !history && !freshness.describe(row).stale && chartNumber(row.gross_bps) ? { timestamp: Date.now() / 1000, gross_bps: row.gross_bps } : null;
         if (liveChannel) liveCurrent = liveChannel.current == null ? null : {timestamp:Date.now()/1000,gross_bps:liveChannel.current};
@@ -1210,18 +1424,50 @@
             liveChannel = drawerChannelState(drawerQuoteRow, channelSpec);
             if (liveChannel) liveCurrent = liveChannel.current == null ? null : {timestamp:Date.now()/1000,gross_bps:liveChannel.current};
             else if (freshness.describe(drawerQuoteRow).stale) liveCurrent = null;
-            renderReversionChart(reversionChart, liveHistory, liveStats, liveCurrent, liveReference, history?.entry_target?.target_bps, liveChannel);
+            renderReversionChart(reversionChart, liveHistory, liveStats, liveCurrent, liveReference, history?.entry_target?.target_bps, liveChannel, chartPosition, liveReverseHistory);
             lastChartPaintAt = Date.now();
         };
         const reversionUrl = API + '/reversion-stats?symbol=' + encodeURIComponent(row.canonical_symbol || '') +
               '&pair=' + encodeURIComponent((channelSpec.canonical && !channelSpec.enabled ? channelSpec.axis : [row.buy_venue,row.sell_venue]).join('->')) +
-              '&seconds=604800&band_bps=2&min_deviation_bps=' + encodeURIComponent(state.reversionMinDeviationBps) + '&target_mode=' + encodeURIComponent(state.reversionTargetMode);
+              '&seconds=' + encodeURIComponent(state.reversionWindow) + '&band_bps=2&min_deviation_bps=' + encodeURIComponent(state.reversionMinDeviationBps) + '&target_mode=' + encodeURIComponent(state.reversionTargetMode);
         const historyUrl = API + '/history?symbol=' + encodeURIComponent(row.canonical_symbol || '') +
-              '&pair=' + encodeURIComponent(channelSpec.axis.join('->')) + '&seconds=604800';
+              '&pair=' + encodeURIComponent(channelSpec.axis.join('->')) + '&seconds=' + encodeURIComponent(state.historyWindow);
+        const reverseHistoryUrl = API + '/history?symbol=' + encodeURIComponent(row.canonical_symbol || '') +
+              '&pair=' + encodeURIComponent([...channelSpec.axis].reverse().join('->')) + '&seconds=' + encodeURIComponent(state.historyWindow);
         const referenceUrl = API + '/reference-history?symbol=' + encodeURIComponent(row.canonical_symbol || '') +
               '&buy_venue=' + encodeURIComponent(channelSpec.axis[0]) + '&sell_venue=' + encodeURIComponent(channelSpec.axis[1]) +
               '&seconds=604800&interval_seconds=300';
         const fetchJson = url => fetch(url, {cache: 'no-store'}).then(response => { if (!response.ok) throw new Error('HTTP ' + response.status); return response.json(); });
+        let reverseBusy=false,reverseLoadedAt=null;
+        const refreshReverseHistory=async()=>{
+            if(!channelSpec.canonical||!chartLineVisible('reverse')||reverseBusy||requestId!==drawerRequestId||
+                reverseLoadedAt!==null&&Date.now()-reverseLoadedAt<30000)return;
+            reverseBusy=true;
+            try {
+                const observations=await fetchJson(reverseHistoryUrl);
+                if(requestId!==drawerRequestId)return;
+                liveReverseHistory=Array.isArray(observations)?observations:[];
+                paintChart();
+            } catch(_) { /* Optional reverse history never blocks the main chart or execution. */ }
+            finally {reverseBusy=false;reverseLoadedAt=Date.now();}
+        };
+        let qualityBusy=false,qualityLoadedAt=0,qualityLoading=true;
+        const qualityUrl=API+'/reversion-quality?symbol='+encodeURIComponent(row.canonical_symbol||'')+
+            '&pair='+encodeURIComponent(channelSpec.axis.join('->'))+'&seconds='+encodeURIComponent(state.reversionWindow)+
+            '&target_mode='+encodeURIComponent(state.reversionTargetMode)+'&min_deviation_bps='+encodeURIComponent(state.reversionMinDeviationBps)+
+            (channelSpec.enabled&&channelSpec.policy?'&channel='+encodeURIComponent(JSON.stringify(channelSpec.policy)):'');
+        const refreshQuality=async()=>{
+            if(!qualityContainer.open||qualityBusy||requestId!==drawerRequestId||
+                qualityLoadedAt&&Date.now()-qualityLoadedAt<(qualityLoading?5000:30000))return;
+            qualityBusy=true;qualityRoot.textContent='正在读取后台回归质量统计…';
+            try {
+                const stats=await fetchJson(qualityUrl);if(requestId!==drawerRequestId)return;
+                qualityLoading=stats.statistics_ready===false;
+                renderReversionQuality(qualityRoot,stats);
+            } catch(_) {qualityLoading=false;if(requestId===drawerRequestId)qualityRoot.textContent='回归质量暂不可用；不影响现有开平仓。';}
+            finally {qualityBusy=false;qualityLoadedAt=Date.now();}
+        };
+        qualityContainer.addEventListener('toggle',()=>{if(qualityContainer.open)refreshQuality();});
         Promise.all([fetchJson(reversionUrl), fetchJson(historyUrl), fetchJson(referenceUrl).catch(() => ({points: []}))])
             .then(([stats, observations, reference]) => {
                 if (requestId !== drawerRequestId) return;
@@ -1237,7 +1483,9 @@
                     + '，最近有效样本 ' + (stats.last_sample_at == null ? '未知' : elapsedLabel(Math.max(0, Date.now()/1000-stats.last_sample_at)) + '前')
                     + (stats.invalid_quote_samples ? '，排除过期或缺失报价 ' + stats.invalid_quote_samples + ' 个' : '')
                     + (stats.center_ready === false ? '；中心尚未就绪，暂不可用于新开仓' : '');
-                const prefix = (channelSpec.enabled ? '辅助统计（原开仓方向近7天，不用于绘制通道边界；目标 ' : '回归统计（近7天，目标 ') + targetLabel + ' ±' + Number(stats.band_bps || 2).toFixed(1) + ' bps' + deviationLabel + '）：';
+                const days = Number(stats.seconds || state.reversionWindow) / 86400;
+                const approximate = stats.approximate ? '聚合近似，不能还原桶内每次触碰；' : '';
+                const prefix = (channelSpec.enabled ? '辅助统计（原开仓方向近'+days+'天，'+approximate+'不用于绘制通道边界；目标 ' : '回归统计（近'+days+'天，'+approximate+'目标 ') + targetLabel + ' ±' + Number(stats.band_bps || 2).toFixed(1) + ' bps' + deviationLabel + '）：';
                 if (!stats.reversion_count) {
                     reversion.textContent = prefix + '暂未观察到完整回归；样本 ' + (stats.samples || 0) + ' 个' + anomalyLabel + qualityLabel + '。';
                     renderReversionDetails(reversionDetails, stats);
@@ -1250,10 +1498,13 @@
             })
             .catch(() => { if (requestId === drawerRequestId) {
                 reversion.textContent = '回归统计暂不可用；不会影响行情和执行前检查。'; reversionDetails.textContent = '';
-                if (channelSpec.enabled) paintChart();
+                if (history || channelSpec.enabled) paintChart();
                 else { disposeReversionChart(); reversionChart.replaceChildren(); reversionChart.textContent = '历史价差曲线暂不可用。'; }
             } });
+        refreshReverseHistory();
         const refreshCurrentSpread = async () => {
+            refreshQuality();
+            refreshReverseHistory();
             try {
                 if (requestId !== drawerRequestId) return;
                 updateQuoteMetrics(refreshReversionEstimate(drawerQuoteRow));
@@ -1277,6 +1528,7 @@
                     if (!Number.isFinite(ask) || !Number.isFinite(bid) || ask <= 0 || bid <= 0) return;
                     if (requestId !== drawerRequestId) return;
                     if (revision === quoteRevision) { updateQuoteMetrics({...row,
+                        pair_directions:undefined,
                         buy_price:ask, sell_price:bid, gross_bps:(bid / ask - 1) * 10000,
                         buy_age_seconds:buy.age_seconds, sell_age_seconds:sell.age_seconds,
                         buy_source:buy.source, sell_source:sell.source, buy_stale:false, sell_stale:false,
@@ -1407,6 +1659,13 @@
                 history_7d_min_bps: row.history_7d_min_bps,
                 history_7d_max_bps: row.history_7d_max_bps,
                 history_7d_avg_bps: row.history_7d_avg_bps,
+                history_target_window_seconds: row.history_target_window_seconds,
+                history_target_samples: row.history_target_samples,
+                history_target_min_bps: row.history_target_min_bps,
+                history_target_max_bps: row.history_target_max_bps,
+                history_target_avg_bps: row.history_target_avg_bps,
+                history_target_raw_samples: row.history_target_raw_samples,
+                history_target_anomaly_count: row.history_target_anomaly_count,
                 history_center_bps: row.history_center_bps,
                 history_p10_bps: row.history_p10_bps,
                 history_p90_bps: row.history_p90_bps,
@@ -1468,7 +1727,7 @@
                 [(row.buy_venue===a?'A买 / B卖':'B买 / A卖')+' · '+reversionEstimate(row), hasReversionScore ? 'reversion-score '+(preview.profit_usdc>=0?'positive':'negative') : 'reversion-score muted', '优选方向 / 预计净收益'],
                 [amountU(row.max_notional_usdc), row.max_notional_usdc == null ? 'max muted' : 'max', '首档容量估算'],
                 [wearLabel(row), 'wear', '磨损'],
-                [historyRange(row), 'history-range', state.historyWindow === 604800 ? '历史价差（7天）' : '历史价差（24h）'],
+                [historyRange(row), 'history-range', historyWindowLabel()],
                 ['买 ' + age(row.buy_age_seconds) + ' · 卖 ' + age(row.sell_age_seconds), 'age', '报价时效'],
                 [opportunityStatus(preview), preview.meets_floor ? 'status positive' : 'status warn', '状态']
             ];
@@ -1490,7 +1749,7 @@
                     }
                 }
                 if (label === '预估回归净收益' || label === '状态') cell.title = (preview.reason || '估算待核验')+'\n'+reversionEstimateDetail(row).split('\n').slice(0,2).join('\n')+'\n点击查看计算明细。';
-                if (label === '历史价差（24h）' || label === '历史价差（7天）') cell.title = historyRangeDetail(row);
+                if (label === historyWindowLabel()) cell.title = historyRangeDetail(row);
                 if (label === '首档容量估算') cell.title = row.max_base_amount == null ? (row.depth_reason || '任一侧未提供首档数量') : '两边首档可成交数量取较小值：'+Number(row.max_base_amount).toLocaleString('en-US',{maximumFractionDigits:8})+' base；两腿按相同基础币数量成交';
                 card.appendChild(cell);
             });
@@ -1872,10 +2131,12 @@
         });
         if ($('v2-refresh-speed')) $('v2-refresh-speed').value = String(state.refreshMs);
         $('v2-history-window')?.addEventListener('change', event => {
-            state.historyWindow = Number(event.target.value) === 604800 ? 604800 : 86400;
+            const value = Number(event.target.value);
+            state.historyWindow = [86400, 604800, 2592000, 7776000].includes(value) ? value : 86400;
             savePrefs();
             updateHistoryWindowLabel();
             renderResult(visibleRows(state.allRows));
+            if (!state.loading) scan(false);
         });
         if ($('v2-history-window')) $('v2-history-window').value = String(state.historyWindow);
         updateHistoryWindowLabel();
@@ -1889,7 +2150,7 @@
             state.reversionRecencyMode = $('v2-reversion-recency-mode')?.value === 'soft' ? 'soft' : 'hard';
             const minSamples = Number($('v2-reversion-min-samples')?.value || 0);
             const targetMode = $('v2-reversion-target')?.value || 'center';
-            const nextWindow = [86400, 259200, 604800].includes(windowValue) ? windowValue : 604800;
+            const nextWindow = [86400, 259200, 604800, 2592000, 7776000].includes(windowValue) ? windowValue : 604800;
             const nextTargetMode = ['center', 'zero', 'either'].includes(targetMode) ? targetMode : 'center';
             const nextMinDeviationBps = Number.isFinite(minDeviationPercent) && minDeviationPercent >= 0 ? minDeviationPercent * 100 : 0;
             if (nextWindow !== state.reversionWindow || nextTargetMode !== state.reversionTargetMode || nextMinDeviationBps !== state.reversionMinDeviationBps) { state.reversionStats.clear(); state.reversionAttempts.clear(); }

@@ -1,6 +1,9 @@
 import json
 import unittest
 import tempfile
+import time
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch, Mock
 from src.common.market_data import utc_now
@@ -139,6 +142,40 @@ class ArcusSigningTest(unittest.TestCase):
 
 
 class ArcusRuntimeGateTest(unittest.TestCase):
+    def test_expired_window_before_intent_is_confirmed_unsent_not_unknown(self):
+        client, journal = Mock(api_key='test-key'), Mock()
+        journal.find.return_value = None
+        adapter = ArcusExecutionAdapter(client, journal, 'test', enabled=True, fee_bps=0)
+        quote = {'symbol': 'BABA', 'size': '.05', 'bid': 100, 'ask': 101,
+                 'updated_at': utc_now(), 'executable': True, 'instrument_type': 'perpetual',
+                 'submit_deadline_monotonic': 9}
+        with patch('src.execution.orders.time.monotonic', return_value=10):
+            result = adapter.place_order('BABA', 'sell', '.05', 100, 10,
+                                        'expired-close', quote, reduce_only=True)
+        self.assertTrue(result['confirmed'])
+        self.assertFalse(result['submitted'])
+        self.assertEqual(result['status'], 'rejected')
+        self.assertEqual(result['filled_size'], 0)
+        journal.reserve.assert_not_called()
+        client.submit.assert_not_called()
+
+    def test_expired_window_cannot_label_an_existing_submission_as_zero_fill(self):
+        client = Mock(api_key='test-key')
+        with tempfile.TemporaryDirectory() as directory:
+            journal = OrderJournal(Path(directory)/'orders.sqlite')
+            journal.reserve('arcus', 'test', 'existing-close', {'reduce_only': True})
+            adapter = ArcusExecutionAdapter(client, journal, 'test', enabled=True, fee_bps=0)
+            quote = {'symbol': 'BABA', 'size': '.05', 'bid': 100, 'ask': 101,
+                     'updated_at': utc_now(), 'executable': True, 'instrument_type': 'perpetual',
+                     'submit_deadline_monotonic': 9}
+            with patch('src.execution.orders.time.monotonic', return_value=10):
+                result = adapter.place_order('BABA', 'sell', '.05', 100, 10,
+                                            'existing-close', quote, reduce_only=True)
+            self.assertFalse(result['confirmed'])
+            self.assertEqual(result['status'], 'unknown')
+            self.assertEqual(journal.summary()[0]['state'], 'submitting')
+            client.submit.assert_not_called()
+
     def test_arcus_requires_credentials_and_fee_evidence(self):
         # Runtime checks deliberately read the current local .env and saved
         # evidence too. Keep this missing-credentials case independent of
@@ -218,4 +255,94 @@ class ArcusOrderPrecheckTest(unittest.TestCase):
                                         enabled=True, fee_bps=0)
         with self.assertRaisesRegex(ValueError, "订单号 live-1.*数量 0.164.*只减仓 是"):
             adapter.validate_order("CRCL", 0.164, reduce_only=True, side="sell")
+
+    def test_reduce_only_keeps_position_and_order_checks_without_balance_request(self):
+        client = self.Client([])
+        client.account = Mock(side_effect=AssertionError('closing must not request balance'))
+        client.positions = Mock(wraps=client.positions)
+        client.orders = Mock(wraps=client.orders)
+        adapter = ArcusExecutionAdapter(client, None, 'acct', enabled=True, fee_bps=0)
+        adapter.validate_order('CRCL', .164, reduce_only=True, side='sell')
+        self.assertEqual((client.positions.call_count, client.orders.call_count), (1, 1))
+        for size, side in ((.165, 'sell'), (.164, 'buy')):
+            with self.subTest(size=size, side=side), self.assertRaisesRegex(ValueError, '真实持仓'):
+                adapter.validate_order('CRCL', size, reduce_only=True, side=side)
+        client.account.assert_not_called()
+
+
+class ArcusCloseRefreshTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.client = Mock(api_key='verified')
+        self.client.market.return_value = {'tick_size': '.000001'}
+        self.client.submit.return_value = {'accepted': False, 'error': 'fixture rejection'}
+        self.journal = OrderJournal(Path(tmp.name)/'orders.sqlite')
+        self.adapter = ArcusExecutionAdapter(self.client, self.journal, 'acct', enabled=True, fee_bps=0)
+        self.quote = dict(symbol='PUMP', size=10, bid=.003905, ask=.003906,
+            updated_at=(datetime.now(timezone.utc)-timedelta(seconds=.3)).isoformat(),
+            executable=True, instrument_type='perpetual')
+
+    def test_residual_refresh_follows_account_check_reuses_local_book_and_is_idempotent(self):
+        events = []
+        def checked(*args, **kwargs):
+            events.append('account')
+        def cached(*args):
+            events.append('book')
+            return dict(fetched_at=utc_now(), bids=[dict(price=.003900, size=20)],
+                        asks=[dict(price=.003901, size=20)])
+        with patch.object(self.adapter, 'validate_order', side_effect=checked) as validate, \
+                patch.object(self.adapter, 'cached_sizing_book', side_effect=cached), \
+                patch.object(self.adapter, 'cached_reference_quote', return_value=None), \
+                patch.object(self.adapter, 'get_executable_quote', side_effect=AssertionError('extra REST quote')), \
+                patch.object(self.adapter, 'account_snapshot_revision', return_value=(True, 7)):
+            result = self.adapter.close_position_from_quote('PUMP', 'buy', 10, 'residual-1', self.quote, slippage_bps=10)
+            repeated = self.adapter.close_position_from_quote('PUMP', 'buy', 10, 'residual-1', self.quote, slippage_bps=10)
+        self.assertEqual(events, ['account', 'book'])
+        validate.assert_called_once_with('PUMP', 10, reduce_only=True, side='sell')
+        self.client.submit.assert_called_once_with('PUMP', 'sell', 10, '0.003897', 'residual-1', True)
+        self.assertEqual(result, repeated)
+        intent = json.loads(self.journal.find('arcus', 'acct', 'residual-1')['intent'])
+        self.assertEqual(float(intent['reference_price']), .003900)
+        self.assertEqual(float(intent['slippage_bps']), 10)
+        self.assertEqual(self.quote['bid'], .003905, 'group-approved quote must not be mutated')
+        self.assertIsNone(self.adapter._close_precheck)
+
+    def test_slow_account_check_gets_quote_after_check_and_account_failure_sends_nothing(self):
+        events = []
+        with patch.object(self.adapter, 'validate_order', side_effect=lambda *a, **k: events.append('account')), \
+                patch.object(self.adapter, 'cached_sizing_book', return_value=None), \
+                patch.object(self.adapter, 'get_executable_quote', side_effect=lambda *a: events.append('quote') or self.quote), \
+                patch.object(self.adapter, 'account_snapshot_revision', return_value=(True, 7)):
+            self.adapter.close_position('PUMP', 'buy', 10, 'no-prefetch')
+        self.assertEqual(events, ['account', 'quote'])
+        self.client.submit.reset_mock()
+        with patch.object(self.adapter, 'validate_order', side_effect=ValueError('active order')), \
+                patch.object(self.adapter, 'cached_sizing_book') as cached:
+            result = self.adapter.close_position_from_quote('PUMP', 'buy', 10, 'blocked', self.quote)
+        self.assertFalse(result['submitted'])
+        self.assertTrue(result['confirmed'])
+        cached.assert_not_called()
+        self.client.submit.assert_not_called()
+
+    def test_account_revision_during_check_forces_validation_again(self):
+        with patch.object(self.adapter, 'validate_order', side_effect=[None, ValueError('position changed')]) as validate, \
+                patch.object(self.adapter, 'cached_sizing_book', return_value=None), \
+                patch.object(self.adapter, 'account_snapshot_revision', side_effect=[(True, 7), (True, 8)]):
+            result = self.adapter.close_position_from_quote('PUMP', 'buy', 10, 'changed', self.quote)
+        self.assertEqual(validate.call_count, 2)
+        self.assertFalse(result['submitted'])
+        self.client.submit.assert_not_called()
+
+    def test_close_proof_is_single_use_exact_quote_quantity_side_and_revision(self):
+        with patch.object(self.adapter, 'account_snapshot_revision', return_value=(True, 7)):
+            for change in ('none', 'copy', 'quantity', 'side', 'expired', 'revision'):
+                with self.subTest(change=change):
+                    checked_at = time.monotonic() - (3 if change == 'expired' else 0)
+                    self.adapter._close_precheck = (self.quote, 'PUMP', Decimal(10), 'sell', checked_at,
+                                                   (True, 8 if change == 'revision' else 7))
+                    consumed = self.adapter._consume_close_precheck('PUMP', 9 if change == 'quantity' else 10,
+                        'buy' if change == 'side' else 'sell', dict(self.quote) if change == 'copy' else self.quote)
+                    self.assertEqual(consumed, change == 'none')
+                    self.assertFalse(self.adapter._consume_close_precheck('PUMP', 10, 'sell', self.quote))
 

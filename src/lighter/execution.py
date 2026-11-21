@@ -29,6 +29,35 @@ class OfficialSDKTransport:
     def __init__(self, sdk, account_index, key_index):
         self.sdk, self.account_index, self.key_index = sdk, int(account_index), int(key_index)
         self.order_stream = None
+        self._sends = set()
+
+    async def _drain_sends(self, deadline=None):
+        # A terminal push can release the other venue immediately, but another
+        # mutation on THIS signer must wait for the SDK's nonce bookkeeping.
+        check_submit_deadline(deadline)
+        if self._sends:
+            if deadline is None:
+                await asyncio.gather(*tuple(self._sends), return_exceptions=True)
+            else:
+                # Expiring the next plan must not cancel the previous signed
+                # HTTP or wait out its entire network timeout.
+                await asyncio.wait(tuple(self._sends), timeout=max(0, deadline - time.monotonic()))
+                check_submit_deadline(deadline)
+
+    def _send_finished(self, task):
+        self._sends.discard(task)
+        if not task.cancelled():
+            task.exception()  # Consume late transport errors; never log SDK data.
+
+    async def _send_order(self, plan, client_index):
+        _, response, error = await self.sdk.create_order(
+            market_index=plan['market_index'], client_order_index=client_index,
+            base_amount=plan['base_amount'], price=plan['price'], is_ask=plan['is_ask'],
+            order_type=self.sdk.ORDER_TYPE_LIMIT,
+            time_in_force=self.sdk.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
+            reduce_only=plan['reduce_only'], order_expiry=self.sdk.DEFAULT_IOC_EXPIRY)
+        data = as_dict(response) if response else {}
+        return {'accepted': not error and data.get('code') == 200}
 
     @classmethod
     def from_credentials(cls, account_index, key_index, private_key,
@@ -70,20 +99,32 @@ class OfficialSDKTransport:
         return token
 
     async def submit(self, plan, client_index):
+        await self._drain_sends(plan.get('submit_deadline_monotonic'))
         check_submit_deadline(plan.get('submit_deadline_monotonic'))
         # Arm before send: a terminal push can arrive before HTTP acceptance.
         # Neither arming nor an acceptance response constitutes a fill.
         if self.order_stream is not None:
             self.order_stream.arm(plan, client_index)
-        _, response, error = await self.sdk.create_order(
-            market_index=plan['market_index'], client_order_index=client_index,
-            base_amount=plan['base_amount'], price=plan['price'], is_ask=plan['is_ask'],
-            order_type=self.sdk.ORDER_TYPE_LIMIT,
-            time_in_force=self.sdk.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
-            reduce_only=plan['reduce_only'], order_expiry=self.sdk.DEFAULT_IOC_EXPIRY)
-        # Acceptance is not execution. Even an SDK error is reconciled before deciding.
-        data = as_dict(response) if response else {}
-        return {'accepted': not error and data.get('code') == 200}
+        send = asyncio.create_task(asyncio.wait_for(self._send_order(plan, client_index), 30))
+        self._sends.add(send)
+        send.add_done_callback(self._send_finished)
+        stream = self.order_stream
+        pushed = (asyncio.create_task(stream.wait_order(plan['market_index'], client_index))
+                  if stream is not None else None)
+        try:
+            if pushed is not None:
+                done, _ = await asyncio.wait((send, pushed), return_when=asyncio.FIRST_COMPLETED)
+                # Only the armed, fully validated terminal order can win. The
+                # normal reconciler still verifies quantity, price and fees.
+                if pushed in done and pushed.result() is not None:
+                    return {'terminal_observed': True}
+            return await asyncio.shield(send)
+        finally:
+            if pushed is not None:
+                pushed.cancel()
+                await asyncio.gather(pushed, return_exceptions=True)
+            # Never cancel an in-flight signed send just because its terminal
+            # push arrived first. Keep it bounded and owned until SDK cleanup.
 
     async def update_leverage(self, market_index, margin_mode, leverage):
         """Set the account's per-market leverage before a new position.
@@ -92,6 +133,7 @@ class OfficialSDKTransport:
         signed account transaction, so the execution path must verify the
         resulting market setting before submitting an order.
         """
+        await self._drain_sends()
         _, response, error = await self.sdk.update_leverage(
             market_index=int(market_index), margin_mode=int(margin_mode),
             leverage=float(leverage), api_key_index=self.key_index)
@@ -100,29 +142,49 @@ class OfficialSDKTransport:
                 'error': str(error) if error else None, 'response': data}
 
     async def find_order(self, market_id, client_index):
+        started = time.monotonic()
         stream = self.order_stream
+        ws_ready = bool(stream is not None and stream.ready)
+        rest_started = False
+        grace_ms = 0.0
+
+        def evidence(row, source, path):
+            if row is None:
+                return None
+            # Copy: never contaminate the stream cache or SDK response. These
+            # local scalars travel with the existing receipt/journal write.
+            return dict(row, _receipt_diagnostics=dict(
+                receipt_source=source, receipt_path=path,
+                receipt_lookup_ms=round((time.monotonic() - started) * 1000, 3),
+                receipt_ws_ready=ws_ready, receipt_rest_started=rest_started,
+                receipt_ws_grace_ms=round(grace_ms, 3)))
+
         if stream is None:
-            return await self._find_order_rest(market_id, client_index)
+            rest_started = True
+            return evidence(await self._find_order_rest(market_id, client_index), 'rest', 'no_stream')
         row = stream.order(market_id, client_index)
         if row is not None:
-            return row
+            return evidence(row, 'websocket', 'cached_push')
         # Give a healthy subscription a short head start, avoiding history
         # requests when the terminal push is already on its way. Disconnected
         # streams add no grace delay. REST and push then race, so a slow REST
         # response cannot hold up complete execution evidence from the socket.
         if stream.ready:
+            grace_started = time.monotonic()
             try:
                 row = await asyncio.wait_for(stream.wait_order(market_id, client_index), .075)
+                grace_ms = (time.monotonic() - grace_started) * 1000
                 if row is not None:
-                    return row
+                    return evidence(row, 'websocket', 'grace_push')
             except asyncio.TimeoutError:
-                pass
+                grace_ms = (time.monotonic() - grace_started) * 1000
+        rest_started = True
         rest = asyncio.create_task(self._find_order_rest(market_id, client_index))
         pushed = asyncio.create_task(stream.wait_order(market_id, client_index))
         try:
             done, _ = await asyncio.wait((rest, pushed), return_when=asyncio.FIRST_COMPLETED)
             if pushed in done and pushed.result() is not None:
-                return pushed.result()
+                return evidence(pushed.result(), 'websocket', 'race_push')
             if rest in done:
                 try:
                     recovered = rest.result()
@@ -133,20 +195,20 @@ class OfficialSDKTransport:
                         try:
                             row = await asyncio.wait_for(pushed, .25)
                             if row is not None:
-                                return row
+                                return evidence(row, 'websocket', 'after_lagging_rest')
                         except asyncio.TimeoutError:
                             pass
-                    return recovered
+                    return evidence(recovered, 'rest', 'race_rest')
                 except Exception:
                     # REST cooldown must not discard an imminent valid push.
                     try:
                         row = await asyncio.wait_for(pushed, .25)
                         if row is not None:
-                            return row
+                            return evidence(row, 'websocket', 'after_rest_error')
                     except asyncio.TimeoutError:
                         pass
                     raise
-            return await rest
+            return evidence(await rest, 'rest', 'race_rest')
         finally:
             for task in (rest, pushed):
                 if not task.done():
@@ -223,10 +285,10 @@ class OfficialSDKTransport:
                 return result
         raise RuntimeError('历史订单分页未完整读取')
 
-    async def trades(self, market_id, order_index):
+    async def trades(self, market_id, order_index, max_pages=20):
         result, cursor = [], None
         token = self.auth()
-        for _ in range(20):
+        for _ in range(max(1, min(int(max_pages), 20))):
             args = dict(sort_by='timestamp', sort_dir='desc', limit=100, market_id=market_id,
                         order_index=order_index, account_index=self.account_index,
                         authorization=token, _request_timeout=5.0)
@@ -239,14 +301,14 @@ class OfficialSDKTransport:
                 return result
         raise RuntimeError('成交分页未完整读取')
 
-    async def position_funding(self, market_id, start_timestamp_ms, end_timestamp_ms):
+    async def position_funding(self, market_id, start_timestamp_ms, end_timestamp_ms, max_pages=20):
         """Read authenticated funding settlements for one account/market."""
         account_api = getattr(self.sdk, 'account_api', None)
         if account_api is None:
             import lighter
             account_api = lighter.AccountApi(self.sdk.api_client)
         result, cursor = [], None
-        for _ in range(20):
+        for _ in range(max(1, min(int(max_pages), 20))):
             args = dict(account_index=self.account_index, limit=100,
                         authorization=self.auth(), market_ids=[int(market_id)],
                         start_timestamp=int(start_timestamp_ms),
@@ -263,10 +325,12 @@ class OfficialSDKTransport:
         raise RuntimeError('资金费分页未完整读取')
 
     async def cancel(self, market_id, order_index):
+        await self._drain_sends()
         await self.sdk.cancel_order(market_index=market_id, order_index=order_index)
 
     async def close(self):
         try:
+            await self._drain_sends()
             if self.order_stream is not None:
                 await self.order_stream.close()
         finally:
@@ -361,10 +425,14 @@ def terminal_receipt(order, plan, account_index, client_index, trades):
         fees = None
     return {'success': filled > 0, 'confirmed': True,
             'status': 'filled' if filled == decimal(plan['size']) else 'partial' if filled else 'canceled',
+            'platform_status': status,
             'filled_size': float(filled), 'average_price': float(price) if price else None,
             'order_id': str(order['order_id']), 'fees_usdc': fees,
             'fee_fields_observed': fee_fields_observed,
             'fees_verified': fees is not None, 'funding_usdc': None,
+            **{key: value for key, value in order.get('_receipt_diagnostics', {}).items()
+               if key in ('receipt_source', 'receipt_path', 'receipt_lookup_ms',
+                          'receipt_ws_ready', 'receipt_rest_started', 'receipt_ws_grace_ms')},
             'note': '非零费用单位与本次平仓资金费未验收时保留未知，不按零处理'}
 
 
@@ -694,6 +762,10 @@ class LighterExecutionAdapter(EntryPrecheckMixin):
         book = self.get_sizing_book(symbol)
         return self.quote_from_sizing_book(symbol, quantity, book)
 
+    def cached_sizing_book(self, symbol, quantity):
+        """Native depth only; the coordinator still validates quantity/age."""
+        return self._fresh_reference_book(symbol, ensure_feed=False)
+
     def quote_from_sizing_book(self, symbol, quantity, book):
         """Build a size-bound quote locally; freshness and depth remain required."""
         age = age_seconds(book['fetched_at'])
@@ -822,7 +894,7 @@ class LighterExecutionAdapter(EntryPrecheckMixin):
                       (1 if int(positions[0]['sign']) > 0 else -1)) if positions else 0
             self.validate_entry_position(symbol, signed, side)
             # Conservative 1x collateral requirement until leverage/margin verification.
-            if decimal(account['available_balance']) < quantity_decimal * market_price:
+            if self.entry_capital_balance(account['available_balance'], symbol, side) < quantity_decimal * market_price:
                 raise ValueError('可用保证金不足以覆盖保守的一倍名义金额')
             return {'available_balance': str(account['available_balance']),
                     'min_base_amount': str(min_base), 'min_quote_amount': str(min_quote)}
@@ -851,7 +923,7 @@ class LighterExecutionAdapter(EntryPrecheckMixin):
         """
         market, _ = self.public.get_market(symbol)
         data, fetched_at = self.public.client.get(
-            '/api/v1/account', {'by': 'index', 'value': self.account_index}, ttl=0)
+            '/api/v1/account', {'by': 'index', 'value': self.account_index}, ttl=0, request_timeout=3)
         matches = [account for account in data.get('accounts', [])
                    if account.get('account_index') == self.account_index]
         if len(matches) != 1:

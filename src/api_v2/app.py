@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException, Query, Response, WebSocket, WebSocke
 from fastapi.middleware.cors import CORSMiddleware
 
 from .adapters import VenueAdapter, build_adapters, canonical_perpetual
-from .history import MultiVenueHistory
+from .history import MAX_HISTORY_SECONDS, MultiVenueHistory
 from .models import Instrument, Opportunity, QuoteSnapshot
 from .return_estimates import attach_return_previews, display_policy
 from src.common.market_data import MarketDataError
@@ -115,10 +115,13 @@ def adapter_timeout(adapter: VenueAdapter) -> float:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    state.adapters = build_adapters()
+    from src.common.quote_clock import quote_clock
+    quote_clock.start()
     try:
+        state.adapters = build_adapters()
         yield
     finally:
+        quote_clock.stop()
         from .center_statistics import close_service
         close_service(state.history)
         await asyncio.gather(*(adapter.close() for adapter in state.adapters.values()),
@@ -336,23 +339,30 @@ def build_opportunities(symbol: str, pairs: Sequence[Tuple[str, str]], quotes_by
 
 
 def attach_history_stats(rows: List[Opportunity], notional: float = 1000.0,
-                         target_mode: str = 'center', target_window_seconds: int = 604800) -> List[Opportunity]:
+                         target_mode: str = 'center', target_window_seconds: int = 604800,
+                         history_window_seconds: int = 604800) -> List[Opportunity]:
     """Observed ranges plus the execution model at the selected filter target."""
     from .center_statistics import center_stats_for
     keys = {(row.canonical_symbol, state.history.pair_key(row.buy_venue, row.sell_venue)) for row in rows}
     stats_24h = {key:center_stats_for(state.history, *key, 86400) for key in keys}
     stats_7d = {key:center_stats_for(state.history, *key, 604800) for key in keys}
+    by_window = {86400: stats_24h, 604800: stats_7d}
+    for window in {int(target_window_seconds), int(history_window_seconds)} - by_window.keys():
+        by_window[window] = {key:center_stats_for(state.history, *key, window) for key in keys}
+    stats_target = by_window[int(target_window_seconds)]
+    stats_display = by_window[int(history_window_seconds)]
     route_stats = {}
     for row in rows:
         key = (row.canonical_symbol, state.history.pair_key(row.buy_venue, row.sell_venue))
         if key not in route_stats:
-            route_stats[key] = stats_7d[key]
+            route_stats[key] = stats_target[key]
     enriched = []
     for row in rows:
         key = (row.canonical_symbol, state.history.pair_key(row.buy_venue, row.sell_venue))
         current = stats_24h.get(key, {})
         weekly = stats_7d.get(key, {})
         reversion = route_stats.get(key, {})
+        display = stats_display.get(key, {})
         center = reversion.get('center_bps')
         samples = int(reversion.get('samples') or 0)
         ready = center is not None and samples >= REVERSION_SCORE_MIN_SAMPLES
@@ -374,6 +384,16 @@ def attach_history_stats(rows: List[Opportunity], notional: float = 1000.0,
             'history_7d_raw_samples': weekly.get('history_raw_samples', 0),
             'history_7d_anomaly_count': weekly.get('history_anomaly_count', 0),
             'history_7d_anomaly_threshold_bps': weekly.get('history_anomaly_threshold_bps'),
+            'history_target_window_seconds': int(history_window_seconds),
+            'history_target_min_bps': display.get('history_min_bps'),
+            'history_target_max_bps': display.get('history_max_bps'),
+            'history_target_avg_bps': display.get('history_avg_bps'),
+            'history_target_samples': display.get('history_samples', 0),
+            'history_target_raw_min_bps': display.get('history_raw_min_bps'),
+            'history_target_raw_max_bps': display.get('history_raw_max_bps'),
+            'history_target_raw_samples': display.get('history_raw_samples', 0),
+            'history_target_anomaly_count': display.get('history_anomaly_count', 0),
+            'history_target_anomaly_threshold_bps': display.get('history_anomaly_threshold_bps'),
             'history_center_bps': center,
             'history_p10_bps': reversion.get('p10_bps'),
             'history_p90_bps': reversion.get('p90_bps'),
@@ -411,7 +431,9 @@ def apply_gross_spread_filter(rows: List[Opportunity], minimum: float = 0,
 
 @app.get("/api/v2/health")
 async def health() -> dict:
-    return {"service": "arbitrage-desk-api", "version": app.version, "mode": "readonly"}
+    from src.common.quote_clock import quote_clock
+    return {"service": "arbitrage-desk-api", "version": app.version, "mode": "readonly",
+            "quote_clock": quote_clock.status()}
 
 
 @app.get("/api/v2/venues")
@@ -478,7 +500,7 @@ async def opportunities(symbol: Optional[str] = Query(default=None),
                         gross_min_bps: float = Query(default=0, ge=0),
                         gross_max_bps: float = Query(default=0, ge=0),
                         target_mode: Annotated[str, Query(pattern='^(center|zero|either)$')] = 'center',
-                        target_window_seconds: Annotated[int, Query(ge=86400, le=604800)] = 604800) -> List[Opportunity]:
+                        target_window_seconds: Annotated[int, Query(ge=86400, le=MAX_HISTORY_SECONDS)] = 604800, history_window_seconds: Annotated[int, Query(ge=86400, le=MAX_HISTORY_SECONDS)] = 604800) -> List[Opportunity]:
     if gross_max_bps and gross_max_bps < gross_min_bps:
         raise HTTPException(status_code=400, detail="毛价差上限不能小于下限")
     symbols_list = requested_symbols(symbol, symbols)
@@ -497,11 +519,11 @@ async def opportunities(symbol: Optional[str] = Query(default=None),
     batches = await asyncio.gather(*(calculate_opportunities(item, pairs, notional) for item in symbols_list))
     result = apply_gross_spread_filter([row for batch in batches for row in batch], gross_min_bps, gross_max_bps)
     result.sort(key=opportunity_sort_key, reverse=True)
-    return sorted(attach_history_stats(result, notional, target_mode, target_window_seconds), key=opportunity_sort_key, reverse=True)
+    return sorted(attach_history_stats(result, notional, target_mode, target_window_seconds, history_window_seconds), key=opportunity_sort_key, reverse=True)
 
 
 @app.get("/api/v2/best-opportunities", response_model=List[Opportunity])
-async def best_opportunities(response: Response, venues: Optional[str] = Query(default=None), venues_pair: Optional[str] = Query(default=None, alias="pair"), limit: int = Query(default=20, ge=1, le=100), notional: float = Query(default=1000.0, ge=1.0, le=1000000.0), target_mode: Annotated[str, Query(pattern='^(center|zero|either)$')] = 'center', target_window_seconds: Annotated[int, Query(ge=86400, le=604800)] = 604800) -> List[Opportunity]:
+async def best_opportunities(response: Response, venues: Optional[str] = Query(default=None), venues_pair: Optional[str] = Query(default=None, alias="pair"), limit: int = Query(default=20, ge=1, le=100), notional: float = Query(default=1000.0, ge=1.0, le=1000000.0), target_mode: Annotated[str, Query(pattern='^(center|zero|either)$')] = 'center', target_window_seconds: Annotated[int, Query(ge=86400, le=MAX_HISTORY_SECONDS)] = 604800, history_window_seconds: Annotated[int, Query(ge=86400, le=MAX_HISTORY_SECONDS)] = 604800) -> List[Opportunity]:
     if venues:
         names = [item.strip() for item in venues.split(",") if item.strip()]
         pairs = list(combinations(dict.fromkeys(names), 2))
@@ -581,15 +603,15 @@ async def best_opportunities(response: Response, venues: Optional[str] = Query(d
     # for every market/pair in a full exchange scan.
     await asyncio.to_thread(state.history.append_many, result)
     result.sort(key=opportunity_sort_key, reverse=True)
-    return sorted(attach_history_stats(result, notional, target_mode, target_window_seconds), key=opportunity_sort_key, reverse=True)[:limit]
+    return sorted(attach_history_stats(result, notional, target_mode, target_window_seconds, history_window_seconds), key=opportunity_sort_key, reverse=True)[:limit]
 
 
 @app.get("/api/v2/history")
 async def history(symbol: str = Query(min_length=1),
-                  seconds: int = Query(default=3600, ge=300, le=604800),
+                  seconds: int = Query(default=3600, ge=300, le=MAX_HISTORY_SECONDS),
                   pair: Optional[str] = Query(default=None)) -> list[dict]:
     """Return history keyed by the selected buy/sell route."""
-    if seconds not in (300, 900, 3600, 21600, 86400, 604800):
+    if seconds not in (300, 900, 3600, 21600, 86400, 604800, 2592000, MAX_HISTORY_SECONDS):
         raise HTTPException(status_code=400, detail="时间范围无效")
     return state.history.read(canonical_perpetual(symbol), seconds, pair)
 
@@ -665,7 +687,7 @@ async def reference_history(symbol: str = Query(min_length=1),
 @app.get("/api/v2/reversion-stats")
 async def reversion_stats(symbol: str = Query(min_length=1),
                           pair: str = Query(min_length=3),
-                          seconds: int = Query(default=604800, ge=300, le=604800),
+                          seconds: int = Query(default=604800, ge=300, le=MAX_HISTORY_SECONDS),
                           band_bps: float = Query(default=2.0, ge=0.1, le=100.0),
                           min_deviation_bps: float = Query(default=0.0, ge=0.0, le=100000.0),
                           target_mode: str = Query(default='center')) -> dict:
@@ -678,10 +700,31 @@ async def reversion_stats(symbol: str = Query(min_length=1),
                                    pair, seconds, band_bps, target_mode, min_deviation_bps, execution_basis=True)
 
 
+@app.get("/api/v2/reversion-quality")
+async def reversion_quality(symbol: str = Query(min_length=1, max_length=64),
+                            pair: str = Query(min_length=3, max_length=128),
+                            seconds: int = Query(default=604800, ge=300, le=MAX_HISTORY_SECONDS),
+                            target_mode: str = Query(default='center'),
+                            min_deviation_bps: float = Query(default=0., ge=0., le=100000.),
+                            channel: Optional[str] = Query(default=None, max_length=4096)) -> dict:
+    """Cached diagnostics only; no exchange reads or execution state changes."""
+    if pair.count('->') != 1 or not all(pair.split('->')) or len(set(pair.split('->'))) != 2:
+        raise HTTPException(status_code=400, detail='需指定两个不同平台的有向路线')
+    from .center_statistics import service_for
+    try:
+        policy = json.loads(channel) if channel is not None else None
+        if channel is not None and not isinstance(policy, dict):
+            raise ValueError('通道统计参数须为对象')
+        return await asyncio.to_thread(service_for(state.history).get_quality,
+            canonical_perpetual(symbol), pair, seconds, target_mode, min_deviation_bps, policy)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.get("/api/v2/reversion-stats-batch")
 async def reversion_stats_batch(
     items: str = Query(default="", description="逗号分隔的 symbol|buy_venue->sell_venue"),
-    seconds: int = Query(default=604800, ge=300, le=604800),
+    seconds: int = Query(default=604800, ge=300, le=MAX_HISTORY_SECONDS),
     band_bps: float = Query(default=2.0, ge=0.1, le=100.0),
     min_deviation_bps: float = Query(default=0.0, ge=0.0, le=100000.0),
     target_mode: str = Query(default='center'),
@@ -748,7 +791,7 @@ async def opportunity_stream(websocket: WebSocket, symbols: str = Query(min_leng
                              gross_min_bps: float = Query(default=0, ge=0),
                              gross_max_bps: float = Query(default=0, ge=0),
                              target_mode: Annotated[str, Query(pattern='^(center|zero|either)$')] = 'center',
-                             target_window_seconds: Annotated[int, Query(ge=86400, le=604800)] = 604800):
+                             target_window_seconds: Annotated[int, Query(ge=86400, le=MAX_HISTORY_SECONDS)] = 604800):
     """Push independent refreshed markets from the requested catalog.
 
     Catalog discovery remains an HTTP scan, while this stream keeps the visible

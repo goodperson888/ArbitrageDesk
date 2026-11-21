@@ -38,6 +38,19 @@ class ProfitExitTests(unittest.TestCase):
         self.assertAlmostEqual(estimate['reference_closing_fee_usdc'], .05)
         self.assertEqual(estimate['closing_fee_source'], 'verified_account_rate_estimate')
 
+    def test_close_limits_shift_to_recent_zero_fill_leg_without_reducing_group_profit(self):
+        self.a.fee_bps, self.b.fee_bps = 1, 4
+        before = self.s._single_exit_estimate(self.p)
+        self.s.close_liquidity.record('arcus', 'SUI', 'sell',
+            dict(confirmed=True, status='canceled', filled_size=0), 1)
+        after = self.s._single_exit_estimate(self.p)
+        self.assertAlmostEqual(after['net_pnl_usdc'], before['net_pnl_usdc'], places=10)
+        self.assertAlmostEqual(after['movement_cost_usdc'], before['movement_cost_usdc'], places=10)
+        self.assertGreater(after['legs']['lighter']['slippage_bps'], before['legs']['lighter']['slippage_bps'])
+        self.assertLess(after['legs']['variational']['slippage_bps'], before['legs']['variational']['slippage_bps'])
+        self.assertTrue(self.s._single_profit_ok(after))
+        self.assertEqual(self.a.closes + self.b.closes, [])
+
     def test_converged_but_unprofitable_decision_is_recorded_without_order_or_log_storm(self):
         self.p.entry_price_variational = 100.02
         with patch.object(self.s, '_record_close_diagnostic') as record:
@@ -147,6 +160,26 @@ class ProfitExitTests(unittest.TestCase):
         self.a.price = 101
         self.assertFalse(self.s.close_position(self.p, '价差收敛'))
         self.assertEqual(self.a.closes + self.b.closes, [])
+
+    def test_arcus_window_expiring_after_intents_keeps_monitoring_when_both_unsent(self):
+        from src.arcus.execution import ArcusExecutionAdapter
+        client, journal = Mock(api_key='test-key'), Mock()
+        journal.find.return_value = None
+        arcus = ArcusExecutionAdapter(client, journal, 'test', enabled=True, fee_bps=0)
+        def expire(symbol, side, size, **kwargs):
+            kwargs['quote'] = dict(kwargs['quote'], submit_deadline_monotonic=time.monotonic()-.000001)
+            return arcus.place_order(symbol, side, size, **kwargs)
+        zero = dict(confirmed=True, status='rejected', filled_size=0, submitted=False)
+        with patch.object(self.a, 'place_order', return_value=zero), \
+                patch.object(self.b, 'place_order', side_effect=expire):
+            self.assertFalse(self.s.close_position(self.p, '价差收敛'))
+        self.assertEqual(self.p.status, 'open')
+        self.assertIsNone(self.s.halted_reason)
+        self.assertIsNone(self.p.close_started_time)
+        self.assertTrue(self.p.close_order_results['lighter']['confirmed'])
+        self.assertFalse(self.p.close_order_results['lighter']['submitted'])
+        journal.reserve.assert_not_called()
+        client.submit.assert_not_called()
 
     def test_missing_fee_funding_and_stale_quotes_all_block_initial_submission(self):
         self.p.pending_fee_venues = ['lighter']

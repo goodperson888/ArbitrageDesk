@@ -22,7 +22,7 @@ from src.execution.browser_session import debugger_status
 class ExecutionConsole:
     def __init__(self, root, diagnostics):
         self.root, self.diagnostics = Path(root), diagnostics
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.process = None
         self.process_log = None
         self.state_path = self.root/'data/console_execution.json'
@@ -339,8 +339,13 @@ class ExecutionConsole:
                 # button so two checks cannot write the pair state together.
                 from src.execution.journal import execution_lease
                 with self.lock, execution_lease(self.root/'data/runtime.lock'):
-                    report = (reconcile_pair(self.root, venues, state_venues=state_venues)
-                              if list(state_venues) != list(venues) else reconcile_pair(self.root, venues))
+                    from src.execution.position_recovery import resume_proof_valid
+                    saved = json.loads(self._pair_state_path(state_venues).read_text())
+                    if not self.stop_path.exists() and resume_proof_valid(saved, venues):
+                        report = dict(success=True, resume_ready=True, orders_submitted=False)
+                    else:
+                        report = (reconcile_pair(self.root, venues, state_venues=state_venues)
+                                  if list(state_venues) != list(venues) else reconcile_pair(self.root, venues))
                     reconciled_orders = (reconcile_unknown_orders(self.root, venues)
                         if report.get('success') is True and report.get('orders_submitted') is False
                         and report.get('accounts_flat') is True else 0)
@@ -459,8 +464,8 @@ class ExecutionConsole:
             reversion_min_samples = int(reversion_min_samples or 0)
         except (TypeError, ValueError):
             raise ValueError('历史回归筛选无效')
-        if not 300 <= reversion_window_seconds <= 604800 or reversion_min_count < 0 or reversion_min_deviation_bps < 0 or reversion_max_age_seconds < 0 or reversion_min_samples < 0:
-            raise ValueError('历史回归筛选必须为非负数，窗口应在 5 分钟至 7 天')
+        if not 300 <= reversion_window_seconds <= 7776000 or reversion_min_count < 0 or reversion_min_deviation_bps < 0 or reversion_max_age_seconds < 0 or reversion_min_samples < 0:
+            raise ValueError('历史回归筛选必须为非负数，窗口应在 5 分钟至 90 天')
         return {**({'follow_saved_cap': True} if follow_saved_cap else {}),
                 'target_notional': target_value,
                 'candidate_fallback': bool(candidate_fallback),
@@ -599,6 +604,13 @@ class ExecutionConsole:
         A running worker or another recorded pair must never be redirected by
         changing scanner settings.
         """
+        # status() may already have started a background account recovery.
+        # Wait for its local write/lease boundary, then reuse its fresh proof.
+        # Launch callers already hold this lock, hence it is reentrant.
+        with self.lock:
+            return self._check_pair_recovery_locked(venues, previous)
+
+    def _check_pair_recovery_locked(self, venues, previous):
         if previous.get('running') or any(v not in ('lighter', 'lighter_rh', 'arcus') for v in venues):
             return None
         recorded = previous.get('venues') or []
@@ -627,9 +639,12 @@ class ExecutionConsole:
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, text=True, timeout=60)
             report = json.loads(result.stdout)
-            if (result.returncode or report.get('success') is not True or
+            if (result.returncode or not isinstance(report, dict) or
                     report.get('orders_submitted') is not False):
                 raise ValueError('recovery_failed')
+            if report.get('success') is not True:
+                return {'success': False, 'orders_submitted': False,
+                        'message': str(report.get('message') or '原仓位只读核对未通过；未发送订单')[:500]}
             return report
         except (OSError, ValueError, TypeError, subprocess.TimeoutExpired) as exc:
             return {'success': False, 'orders_submitted': False,
@@ -1364,6 +1379,27 @@ class ExecutionConsole:
                     'message': '平台历史正在补查，请等待当前查询完成。'}
         try:
             return self._platform_history_read(venues, symbols, limit)
+        finally:
+            self._history_guard.release()
+
+    def pending_accounting(self, position):
+        """Optional closed-position evidence only, isolated from order control."""
+        from src.execution.pending_accounting import POSITION_FIELDS
+        if not self._history_guard.acquire(blocking=False):
+            return dict(success=False, complete=False, deferred=True, orders_submitted=False)
+        try:
+            payload = {key: position[key] for key in POSITION_FIELDS if key in position}
+            result = subprocess.run([str(execution_python(self.root)), '-B',
+                str(self.root / 'scripts/query_pending_accounting.py')], cwd=self.root,
+                input=json.dumps(payload, ensure_ascii=False), stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, timeout=25)
+            report = json.loads(result.stdout)
+            if result.returncode or report.get('orders_submitted') is not False:
+                raise ValueError('invalid_accounting_report')
+            return report
+        except (subprocess.TimeoutExpired, ValueError, OSError, TypeError):
+            return dict(success=False, complete=False, orders_submitted=False,
+                        message='账务补查暂不可用，稍后自动重试')
         finally:
             self._history_guard.release()
 

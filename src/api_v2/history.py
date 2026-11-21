@@ -17,6 +17,11 @@ from .models import Opportunity
 
 
 HISTORY_RETENTION_SECONDS = 7 * 86400
+ROLLUP_5M_SECONDS = 5 * 60
+ROLLUP_1H_SECONDS = 60 * 60
+ROLLUP_5M_RETENTION_SECONDS = 30 * 86400
+ROLLUP_1H_RETENTION_SECONDS = 90 * 86400
+MAX_HISTORY_SECONDS = ROLLUP_1H_RETENTION_SECONDS
 OBSERVATION_BUCKET_SECONDS = 30
 # Keep raw observations for diagnosis, but keep single-feed spikes out of
 # route statistics and reversion events.  The fixed floor catches isolated
@@ -70,6 +75,31 @@ class MultiVenueHistory:
                 "ON observations(symbol, pair_key, ts)"
             )
             db.execute("CREATE INDEX IF NOT EXISTS idx_observations_ts ON observations(ts)")
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS observation_rollups (
+                    symbol TEXT NOT NULL,
+                    ts INTEGER NOT NULL,
+                    pair_key TEXT NOT NULL,
+                    buy_venue TEXT NOT NULL,
+                    sell_venue TEXT NOT NULL,
+                    bucket_seconds INTEGER NOT NULL,
+                    sample_count INTEGER NOT NULL,
+                    executable_count INTEGER NOT NULL DEFAULT 0,
+                    sum_bps REAL NOT NULL,
+                    sum_sq_bps REAL NOT NULL,
+                    min_bps REAL NOT NULL,
+                    max_bps REAL NOT NULL,
+                    last_bps REAL NOT NULL,
+                    last_ts INTEGER NOT NULL,
+                    PRIMARY KEY(symbol, ts, pair_key, bucket_seconds)
+                )"""
+            )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_rollups_symbol_pair_ts "
+                "ON observation_rollups(symbol, pair_key, ts, bucket_seconds)"
+            )
+            db.execute("CREATE INDEX IF NOT EXISTS idx_rollups_bucket_ts "
+                       "ON observation_rollups(bucket_seconds, ts)")
             # Retention deletes can leave free pages behind. Compact only on
             # startup when fragmentation is material, never during a quote
             # request, so exchange reads are not blocked by maintenance.
@@ -132,13 +162,132 @@ class MultiVenueHistory:
                     values,
                 )
                 if cleanup:
-                    db.execute("DELETE FROM observations WHERE ts < ?", (now - HISTORY_RETENTION_SECONDS,))
+                    self._archive_history(db, now)
             if cleanup:
                 self._last_cleanup = tick
+
+    @staticmethod
+    def _archive_history(db, now: int) -> None:
+        """Age complete buckets once per cleanup, never on every quote.
+
+        Each pass transfers at most an hour per tier. INSERT OR IGNORE and
+        source deletion share one transaction, including after a crash. Keep
+        unprocessed source rows if a large backlog needs later passes.
+        """
+        raw_cutoff = (now - HISTORY_RETENTION_SECONDS) // ROLLUP_5M_SECONDS * ROLLUP_5M_SECONDS
+        oldest = db.execute('SELECT MIN(ts) FROM observations WHERE ts<?', (raw_cutoff,)).fetchone()[0]
+        if oldest is not None:
+            end = min(raw_cutoff, (int(oldest) // ROLLUP_5M_SECONDS + 12) * ROLLUP_5M_SECONDS)
+            db.execute("""INSERT OR IGNORE INTO observation_rollups
+                (symbol,ts,pair_key,buy_venue,sell_venue,bucket_seconds,sample_count,
+                 executable_count,sum_bps,sum_sq_bps,min_bps,max_bps,last_bps,last_ts)
+                SELECT symbol, CAST(ts / 300 AS INTEGER)*300, pair_key, buy_venue,
+                       sell_venue, 300, COUNT(*), SUM(executable), SUM(gross_bps),
+                       SUM(gross_bps*gross_bps), MIN(gross_bps), MAX(gross_bps),
+                       AVG(gross_bps), MAX(ts)
+                  FROM observations WHERE ts<? AND gross_bps IS NOT NULL
+                   AND ABS(gross_bps)<1e100
+                   AND buy_age_seconds BETWEEN 0 AND 5 AND sell_age_seconds BETWEEN 0 AND 5
+                 GROUP BY symbol,pair_key,CAST(ts / 300 AS INTEGER)""", (end,))
+            db.execute('DELETE FROM observations WHERE ts<?', (end,))
+        hour_cutoff = (now - ROLLUP_5M_RETENTION_SECONDS) // ROLLUP_1H_SECONDS * ROLLUP_1H_SECONDS
+        oldest = db.execute('SELECT MIN(ts) FROM observation_rollups WHERE bucket_seconds=300 AND ts<?',
+                            (hour_cutoff,)).fetchone()[0]
+        if oldest is not None:
+            end = min(hour_cutoff, (int(oldest) // ROLLUP_1H_SECONDS + 1) * ROLLUP_1H_SECONDS)
+            db.execute("""INSERT OR IGNORE INTO observation_rollups
+                (symbol,ts,pair_key,buy_venue,sell_venue,bucket_seconds,sample_count,
+                 executable_count,sum_bps,sum_sq_bps,min_bps,max_bps,last_bps,last_ts)
+                SELECT symbol, CAST(ts / 3600 AS INTEGER)*3600, pair_key, buy_venue,
+                       sell_venue, 3600, SUM(sample_count), SUM(executable_count), SUM(sum_bps),
+                       SUM(sum_sq_bps), MIN(min_bps), MAX(max_bps),
+                       SUM(sum_bps)/SUM(sample_count), MAX(last_ts)
+                  FROM observation_rollups WHERE bucket_seconds=300 AND ts<?
+                 GROUP BY symbol,pair_key,CAST(ts / 3600 AS INTEGER)""", (end,))
+            db.execute('DELETE FROM observation_rollups WHERE bucket_seconds=300 AND ts<?', (end,))
+        db.execute('DELETE FROM observation_rollups WHERE bucket_seconds=3600 AND ts<?',
+                   ((now - MAX_HISTORY_SECONDS) // ROLLUP_1H_SECONDS * ROLLUP_1H_SECONDS,))
+
+    @staticmethod
+    def _rollup_row_to_sample(row):
+        ts, key, buy, sell, bucket_seconds, count, executable_count, total, total_sq, low, high, last, last_ts = row
+        return {
+            'timestamp': int(last_ts or ts), 'bucket_timestamp': int(ts),
+            'pair_key': key, 'buy_venue': buy, 'sell_venue': sell,
+            'gross_bps': float(total) / max(1, int(count)),
+            'low_bps': float(low), 'high_bps': float(high),
+            'spread_basis': 'buy_ask', 'buy_age_seconds': 0,
+            'sell_age_seconds': 0, 'executable': False,
+            'had_executable_samples': bool(executable_count),
+            'aggregate': True, 'bucket_seconds': int(bucket_seconds),
+            'sample_count': int(count),
+        }
+
+    def _read_rollup_rows(self, db, symbol, pair_key, start, now, bucket_seconds):
+        clauses = ['symbol=?', 'ts>=?', 'ts<=?', 'bucket_seconds=?']
+        params = [symbol, start, now, bucket_seconds]
+        if pair_key:
+            clauses.append('pair_key=?')
+            params.append(pair_key)
+        query = ('SELECT ts,pair_key,buy_venue,sell_venue,bucket_seconds,sample_count,'
+                 'executable_count,sum_bps,sum_sq_bps,min_bps,max_bps,last_bps,last_ts '
+                 'FROM observation_rollups WHERE ' + ' AND '.join(clauses) +
+                 ' ORDER BY ts,pair_key,bucket_seconds')
+        return [self._rollup_row_to_sample(row) for row in db.execute(query, params).fetchall()]
+
+    def _read_long_rows(self, db, symbol, pair_key, seconds, now):
+        start = now - int(seconds)
+        raw_cutoff = (now - HISTORY_RETENTION_SECONDS) // ROLLUP_5M_SECONDS * ROLLUP_5M_SECONDS
+        raw_start = max(start, raw_cutoff)
+        clauses = ['symbol=?', 'ts>=?', 'ts<=?']
+        params = [symbol, raw_start, now]
+        if pair_key:
+            clauses.append('pair_key=?')
+            params.append(pair_key)
+        raw = db.execute(
+            'SELECT ts,pair_key,buy_venue,sell_venue,gross_bps,buy_age_seconds,'
+            'sell_age_seconds,executable,reason FROM observations WHERE ' + ' AND '.join(clauses) +
+            ' ORDER BY ts,pair_key', params).fetchall()
+        rows = [dict(timestamp=ts,pair_key=key,buy_venue=buy,sell_venue=sell,gross_bps=gross,
+                     spread_basis='buy_ask',buy_age_seconds=buy_age,sell_age_seconds=sell_age,
+                     executable=bool(executable),reason=reason,aggregate=False)
+                for ts,key,buy,sell,gross,buy_age,sell_age,executable,reason in raw]
+        cutoff = raw_cutoff
+        thirty_day_cutoff = (now - ROLLUP_5M_RETENTION_SECONDS) // ROLLUP_1H_SECONDS * ROLLUP_1H_SECONDS
+        rows.extend(self._read_rollup_rows(
+            db, symbol, pair_key, max(start // ROLLUP_5M_SECONDS * ROLLUP_5M_SECONDS, thirty_day_cutoff), cutoff - 1, ROLLUP_5M_SECONDS))
+        rows.extend(self._read_rollup_rows(
+            db, symbol, pair_key, start // ROLLUP_1H_SECONDS * ROLLUP_1H_SECONDS,
+            min(cutoff - 1, thirty_day_cutoff - 1), ROLLUP_1H_SECONDS))
+        # Raw rows cover the latest seven days. Rollup rows cover the older
+        # portions at exactly one resolution, preventing duplicate points.
+        return sorted((row for row in rows if start <= int(row['timestamp']) <= now),
+                      key=lambda row: (int(row['timestamp']), row.get('pair_key') or ''))
 
     def read(self, symbol: str, seconds: int = 3600,
              pair_key: Optional[str] = None, limit: int = 1800) -> list[dict]:
         now = int(time.time())
+        if int(seconds) > HISTORY_RETENTION_SECONDS:
+            with self.lock, self._connect() as db:
+                rows = self._read_long_rows(db, symbol, pair_key, int(seconds), now)
+            numeric_values = [float(row['gross_bps']) for row in rows
+                              if row.get('gross_bps') is not None]
+            anomaly_mask, anomaly_threshold_bps, _ = self._anomaly_mask(numeric_values)
+            result = []
+            numeric_index = 0
+            for row in rows:
+                gross = row.get('gross_bps')
+                anomalous = bool(anomaly_mask[numeric_index]) if gross is not None else False
+                if gross is not None:
+                    numeric_index += 1
+                row.update(valid_for_center=not anomalous and gross is not None and all(
+                               isinstance(age, (int, float)) and math.isfinite(age) and 0 <= age <= 5
+                               for age in (row.get('buy_age_seconds'), row.get('sell_age_seconds'))),
+                           anomalous=anomalous,
+                           anomaly_reason='偏离历史中位数或超过绝对上限' if anomalous else None,
+                           anomaly_threshold_bps=anomaly_threshold_bps)
+                result.append(row)
+            return self._limit_history_rows(result, limit)
         clauses = ["symbol = ?", "ts >= ?"]
         params: list[object] = [symbol, now - seconds]
         if pair_key:
@@ -180,10 +329,17 @@ class MultiVenueHistory:
                 "anomaly_reason": "偏离历史中位数或超过绝对上限" if anomalous else None,
                 "anomaly_threshold_bps": anomaly_threshold_bps,
             })
+        return self._limit_history_rows(result, limit)
+
+    @staticmethod
+    def _limit_history_rows(result, limit):
         if len(result) <= limit:
             return result
-        step = max(1, (len(result) + limit - 1) // limit)
-        return result[::step][:limit]
+        limit = max(1, int(limit))
+        if limit == 1:
+            return result[-1:]
+        # Always retain both endpoints, especially the most recent sample.
+        return [result[round(i * (len(result) - 1) / (limit - 1))] for i in range(limit)]
 
     def stats_for(self, rows: Iterable[Opportunity], seconds: int = 86400) -> dict[tuple[str, str], dict]:
         """Return robust route ranges and separately retain raw diagnostics."""
@@ -289,16 +445,47 @@ class MultiVenueHistory:
                 return cached[1]
             now = int(time.time())
             with self._connect() as db:
-                raw = db.execute('SELECT ts,gross_bps,buy_age_seconds,sell_age_seconds FROM observations '
-                    'WHERE symbol=? AND pair_key=? AND ts>=? AND gross_bps IS NOT NULL ORDER BY ts',
-                    (symbol, pair_key, now-seconds)).fetchall()
-            fresh = [(stamp, value) for stamp, value, buy_age, sell_age in raw
-                     if math.isfinite(value) and stamp <= now and all(isinstance(age,(int,float))
-                        and math.isfinite(age) and 0 <= age <= 5 for age in (buy_age,sell_age))]
+                if int(seconds) <= HISTORY_RETENTION_SECONDS:
+                    raw = db.execute('SELECT ts,gross_bps,buy_age_seconds,sell_age_seconds FROM observations '
+                        'WHERE symbol=? AND pair_key=? AND ts>=? AND gross_bps IS NOT NULL ORDER BY ts',
+                        (symbol, pair_key, now-seconds)).fetchall()
+                    fresh = [(stamp, value) for stamp, value, buy_age, sell_age in raw
+                             if math.isfinite(value) and stamp <= now and all(isinstance(age,(int,float))
+                                and math.isfinite(age) and 0 <= age <= 5 for age in (buy_age,sell_age))]
+                    source_samples = len(raw)
+                    aggregate_buckets = 0
+                    sample_interval = OBSERVATION_BUCKET_SECONDS
+                    invalid_samples = len(raw) - len(fresh)
+                else:
+                    long_rows = self._read_long_rows(db, symbol, pair_key, int(seconds), now)
+                    sample_interval = (ROLLUP_1H_SECONDS if int(seconds) > ROLLUP_5M_RETENTION_SECONDS
+                                       else ROLLUP_5M_SECONDS)
+                    # Equal-duration representatives prevent the most recent
+                    # raw seven days from dominating coarse older samples.
+                    bins = {}
+                    source_samples = invalid_samples = aggregate_buckets = 0
+                    for row in long_rows:
+                        count = int(row.get('sample_count') or 1)
+                        source_samples += count
+                        value = row.get('gross_bps')
+                        if (not isinstance(value, (int, float)) or not math.isfinite(value)
+                                or not all(isinstance(age, (int, float)) and math.isfinite(age)
+                                           and 0 <= age <= 5 for age in
+                                           (row.get('buy_age_seconds'), row.get('sell_age_seconds')))):
+                            invalid_samples += count
+                            continue
+                        bucket = int(row['timestamp']) // sample_interval * sample_interval
+                        total, samples, latest = bins.get(bucket, (0., 0, 0))
+                        bins[bucket] = (total + float(value) * count, samples + count,
+                                        max(latest, int(row['timestamp'])))
+                        aggregate_buckets += int(bool(row.get('aggregate')))
+                    fresh = [(latest, total / count) for _, (total, count, latest) in sorted(bins.items())]
             rows, anomalies, threshold, raw_center = self._clean_rows(fresh)
-            finite = [r[1] for r in raw if math.isfinite(r[1])]
+            finite = [r[1] for r in fresh if math.isfinite(r[1])]
             prepared = dict(rows=rows, ordered=sorted(value for _,value in rows),
-                raw_samples=len(raw), invalid_quote_samples=len(raw)-len(fresh),
+                raw_samples=source_samples, invalid_quote_samples=invalid_samples,
+                sample_interval_seconds=sample_interval, approximate=sample_interval > OBSERVATION_BUCKET_SECONDS,
+                aggregate_buckets=aggregate_buckets,
                 anomaly_count=anomalies, anomaly_threshold_bps=threshold,
                 raw_center_bps=raw_center, raw_min_bps=min(finite,default=None),
                 raw_max_bps=max(finite,default=None))
@@ -419,6 +606,8 @@ class MultiVenueHistory:
             'symbol': symbol,
             'pair_key': pair_key,
             'seconds': seconds,
+            'sample_interval_seconds': prepared.get('sample_interval_seconds', 30),
+            'approximate': prepared.get('approximate', False),
             'band_bps': band_bps,
             'min_deviation_bps': min_deviation_bps,
             'target_mode': target_mode,

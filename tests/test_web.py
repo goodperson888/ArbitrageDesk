@@ -404,6 +404,27 @@ class WebTests(unittest.TestCase):
         self.assertEqual(ConfigLoader(self.path).get('strategy.trading.position_size'), 25)
         self.assertNotEqual(web.strategy.position_size, 25)
 
+    def test_capital_budget_settings_persist_and_reject_invalid_values(self):
+        values=dict(capital_reserve_percent=20,capital_reserve_usdc=10,capital_allocation_mode='remaining_slots')
+        response=self.client.post('/api/config',json={'strategy':{'trading':values}})
+        self.assertEqual(response.status_code,200)
+        for key,value in values.items():
+            self.assertEqual(ConfigLoader(self.path).get('strategy.trading.'+key),value)
+        before=self.path.read_text()
+        for bad in ({'capital_reserve_percent':100},{'capital_reserve_usdc':-1},
+                    {'capital_allocation_mode':'margin_equal'},{'capital_reserve_percent':True}):
+            self.assertEqual(self.client.post('/api/config',json={'strategy':{'trading':bad}}).status_code,400)
+            self.assertEqual(self.path.read_text(),before)
+
+    def test_old_worker_cannot_silently_ignore_enabled_capital_reserve(self):
+        before=self.path.read_text()
+        with patch.object(web.execution_console,'status',return_value={'running':True}),\
+                patch.object(web,'_position_monitor_payload',return_value={'monitor':{'entry_limits':{'version':1}}}):
+            response=self.client.post('/api/config',json={'strategy':{'trading':{'capital_reserve_percent':20}}})
+        self.assertEqual(response.status_code,409)
+        self.assertIn('未加载资金预留',response.get_json()['error'])
+        self.assertEqual(self.path.read_text(),before)
+
     def test_old_running_worker_cannot_silently_load_unrecognized_channel_mode(self):
         before=self.path.read_bytes()
         with patch.object(web.execution_console,'status',return_value={'running':True}), \
@@ -412,6 +433,28 @@ class WebTests(unittest.TestCase):
         self.assertEqual(result.status_code,409)
         self.assertIn('尚未加载通道策略',result.get_json()['error'])
         self.assertEqual(self.path.read_bytes(),before)
+
+    def test_touch_channel_cannot_be_saved_into_old_worker_and_new_worker_accepts_it(self):
+        before=self.path.read_bytes()
+        payload={'strategy':{'entry_policy':{'mode':'channel','calculation_version':2,'funding_reserve_bps':0},
+            'channel_policy':{'method':'touches','touch_min_count':4,'touch_tolerance_bps':1.5}}}
+        with patch.object(web.execution_console,'status',return_value={'running':True}):
+            with patch.object(web,'_position_monitor_payload',return_value={'monitor':{'channel_policy_version':1}}):
+                result=self.client.post('/api/config',json=payload)
+            self.assertEqual(result.status_code,409)
+            self.assertIn('尚未加载反复触碰通道',result.get_json()['error'])
+            self.assertEqual(self.path.read_bytes(),before)
+            with patch.object(web,'_position_monitor_payload',return_value={'monitor':{'channel_policy_version':2}}):
+                result=self.client.post('/api/config',json=payload)
+            self.assertEqual(result.status_code,200)
+            self.assertTrue(result.get_json()['pending'])
+        self.assertEqual(ConfigLoader(self.path).get('strategy.channel_policy.touch_min_count'),4)
+        saved=self.path.read_bytes()
+        payload['strategy']['channel_policy']['touch_min_count']=2.5
+        with patch.object(web.execution_console,'status',return_value={'running':False}):
+            result=self.client.post('/api/config',json=payload)
+        self.assertEqual(result.status_code,400)
+        self.assertEqual(self.path.read_bytes(),saved)
 
     def test_strategy_preview_is_token_protected_and_read_only(self):
         payload={'symbol':'SUI','venues':['arcus','lighter'],'channel_policy':{'method':'fixed'}}

@@ -22,6 +22,8 @@ from src.common.rate_limit import RateLimitError, DiscoveryThrottleError
 from src.common.discovery import (ArcusSubscriptionError, arcus_subscription_batches,
                                   check_arcus_subscription_error)
 from src.execution.funding_forecast import forecast
+from src.common.market_data import (MarketDataError, normalize_quote_time,
+                                    cached_quote_age, cached_quote_time)
 
 from .adapters import VenueAdapter, canonical_perpetual
 from .models import CatalogMode, Instrument, QuoteSnapshot, VenueCapability, VenueStatus
@@ -66,6 +68,8 @@ class ArcusAdapter(VenueAdapter):
         self._direct_client: Optional[httpx.AsyncClient] = None
         self._proxy_failed_until = 0.0
         self._catalog_cache: Optional[tuple[datetime, List[Instrument]]] = None
+        self._catalog_task: Optional[asyncio.Task] = None
+        self._catalog_retry_at = 0.0
         self._market_by_id: Dict[str, Instrument] = {}
         self._market_by_name: Dict[str, Instrument] = {}
         self._oracle: Dict[str, tuple[float, datetime]] = {}
@@ -88,10 +92,13 @@ class ArcusAdapter(VenueAdapter):
         use_proxy = bool(self.proxy_url) and time.monotonic() >= self._proxy_failed_until
         try:
             if not self.proxy_url or use_proxy:
-                response = await self._client.get(self.base_url + path, params=params)
+                # Both attempts must finish inside the API's six-second
+                # connector deadline. httpx's phase timeout alone can exceed it.
+                response = await asyncio.wait_for(
+                    self._client.get(self.base_url + path, params=params), timeout=2.5)
             else:
                 raise httpx.ProxyError("proxy temporarily unavailable")
-        except (httpx.ProxyError, httpx.ConnectError, httpx.ConnectTimeout,
+        except (asyncio.TimeoutError, httpx.ProxyError, httpx.ConnectError, httpx.ConnectTimeout,
                 httpx.ReadTimeout, httpx.PoolTimeout):
             if not self.proxy_url:
                 raise
@@ -100,7 +107,8 @@ class ArcusAdapter(VenueAdapter):
                 self._direct_client = httpx.AsyncClient(
                     timeout=httpx.Timeout(8.0, connect=3.0)
                 )
-            response = await self._direct_client.get(self.base_url + path, params=params)
+            response = await asyncio.wait_for(
+                self._direct_client.get(self.base_url + path, params=params), timeout=2.5)
         self.rate_limit.reject(response)
         response.raise_for_status()
         return response.json()
@@ -112,17 +120,18 @@ class ArcusAdapter(VenueAdapter):
         return _number(value.get("price")), _number(value.get("size"))
 
     @staticmethod
-    def _observed_timestamp(value: Any, received: datetime) -> datetime:
+    def _observed_timestamp(value: Any, received: datetime, received_monotonic=None) -> datetime:
         """Convert Arcus' Unix-microsecond timestamp without trusting bad clocks."""
         stamp = _number(value)
-        if not stamp or stamp <= 1_000_000_000_000:
+        if value is None:
             return received
+        if not stamp or stamp <= 1_000_000_000_000:
+            raise MarketDataError('行情接收时间无效，等待新报价')
         try:
             observed = datetime.fromtimestamp(stamp / 1_000_000, tz=timezone.utc)
         except (OverflowError, OSError, ValueError):
-            return received
-        age = (received - observed).total_seconds()
-        return observed if -2 <= age <= 120 else received
+            raise MarketDataError('行情接收时间无效，等待新报价') from None
+        return normalize_quote_time(observed, received, received_monotonic=received_monotonic)
 
     def _handle_ws_message(self, message: Any) -> None:
         """Normalize Arcus channel envelopes without logging raw payloads."""
@@ -171,13 +180,19 @@ class ArcusAdapter(VenueAdapter):
         ask, ask_size = self._level(contents.get("bestAsk"))
         if bid is None and ask is None:
             return
-        # BBO timestamps are Unix microseconds.  Use receipt time when a
-        # malformed/clock-skewed stamp is supplied.
+        # Use the same calibrated clock as live execution. Old/future venue
+        # timestamps must never be renewed by replacing them with receipt time.
         received = datetime.now(timezone.utc)
-        observed = self._observed_timestamp(contents.get("timestamp"), received)
+        received_mono = time.monotonic()
+        try:
+            observed = self._observed_timestamp(contents.get("timestamp"), received, received_mono)
+        except MarketDataError:
+            self._bbo.pop(instrument.canonical_symbol, None)
+            return
         self._bbo[instrument.canonical_symbol] = {
             "bid": bid, "ask": ask, "bid_size": bid_size, "ask_size": ask_size,
             "observed": observed, "received": received, "source": "arcus_websocket",
+            'observed_monotonic': received_mono-(received-observed).total_seconds(),
         }
         if bid is not None and ask is not None and 0 < bid <= ask and (received - observed).total_seconds() <= 10:
             self._discovery_cooldown.fresh_stream(instrument.canonical_symbol)
@@ -190,6 +205,19 @@ class ArcusAdapter(VenueAdapter):
         now = datetime.now(timezone.utc)
         if self._catalog_cache and (now - self._catalog_cache[0]).total_seconds() < 60:
             return list(self._catalog_cache[1])
+        if self._catalog_cache and time.monotonic() < self._catalog_retry_at:
+            return list(self._catalog_cache[1])
+        if self._catalog_task is None or self._catalog_task.done():
+            self._catalog_task = asyncio.create_task(self._refresh_catalog())
+            self._catalog_task.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
+        if self._catalog_cache:
+            # Catalog metadata may be reused while refreshing. Live BBO age
+            # is still checked separately; no old quote becomes fresh here.
+            return list(self._catalog_cache[1])
+        return await asyncio.shield(self._catalog_task)
+
+    async def _refresh_catalog(self) -> List[Instrument]:
+        now = datetime.now(timezone.utc)
         try:
             payload = await self._get("/v1/markets")
             rows = payload.get("markets", []) if isinstance(payload, dict) else []
@@ -229,10 +257,12 @@ class ArcusAdapter(VenueAdapter):
             self._catalog_cache = (now, result)
             self._market_by_name = {row.venue_symbol.upper():row for row in result}
             self._ensure_ws()
+            self._catalog_retry_at = 0.0
             self._last_error = None
             return list(result)
         except Exception as exc:
             self._last_error = f"Arcus 市场目录请求失败：{type(exc).__name__}"
+            self._catalog_retry_at = time.monotonic() + 15.0
             if self._catalog_cache:
                 return list(self._catalog_cache[1])
             raise
@@ -319,7 +349,7 @@ class ArcusAdapter(VenueAdapter):
             observed = cached[1] if cached else datetime.now(timezone.utc)
             bbo = self._bbo.get(instrument.canonical_symbol)
             now_mono = time.monotonic()
-            cached_age = ((datetime.now(timezone.utc) - bbo['observed']).total_seconds()
+            cached_age = (cached_quote_age((datetime.now(timezone.utc) - bbo['observed']).total_seconds(), bbo.get('observed_monotonic'))
                           if bbo else None)
             book_note = None
             # Low-volume markets may not emit another BBO event for a while.
@@ -339,10 +369,12 @@ class ArcusAdapter(VenueAdapter):
                         best_ask, ask_size = self._level(body.get('bestAsk'))
                         if best_bid is not None or best_ask is not None:
                             received = datetime.now(timezone.utc)
-                            observed = self._observed_timestamp(body.get('timestamp'), received)
+                            received_mono = time.monotonic()
+                            observed = self._observed_timestamp(body.get('timestamp'), received, received_mono)
                             bbo = {'bid': best_bid, 'ask': best_ask,
                                    'bid_size': bid_size, 'ask_size': ask_size,
                                    'observed': observed, 'received': received,
+                                   'observed_monotonic': received_mono-(received-observed).total_seconds(),
                                    'source': 'arcus_rest'}
                             self._bbo[instrument.canonical_symbol] = bbo
                             if best_bid is not None and best_ask is not None and 0 < best_bid <= best_ask:
@@ -370,7 +402,8 @@ class ArcusAdapter(VenueAdapter):
                 except DiscoveryCooldownError as exc:
                     book_note = str(exc)
             age = max(0.0, (datetime.now(timezone.utc) - observed).total_seconds())
-            book_age = (datetime.now(timezone.utc) - bbo['observed']).total_seconds() if bbo else None
+            book_age = cached_quote_age((datetime.now(timezone.utc) - bbo['observed']).total_seconds(),
+                                       bbo.get('observed_monotonic')) if bbo else None
             fresh_age = max(0.0, book_age) if book_age is not None else age
             return QuoteSnapshot(
                 venue=self.venue, symbol=symbol, venue_symbol=instrument.venue_symbol,
@@ -382,7 +415,7 @@ class ArcusAdapter(VenueAdapter):
                 # wired into this read-only adapter yet.
                 executable=False,
                 stale=(bbo is None or fresh_age > 10.0), age_seconds=fresh_age,
-                fetched_at=bbo['observed'] if bbo else observed,
+                fetched_at=cached_quote_time(bbo['observed'].isoformat(),bbo.get('observed_monotonic')) if bbo else observed,
                 reason=book_note or ("Arcus BBO 公开行情；实盘下单需在连接与实盘检查中完成 API Signing Key 与费率核验"
                                      if bbo else "Arcus 暂未收到 BBO 盘口"),
                 metadata={**instrument.metadata, "bid_size_base": bbo.get('bid_size') if bbo else None,
@@ -444,6 +477,9 @@ class ArcusAdapter(VenueAdapter):
         )
 
     async def close(self) -> None:
+        if self._catalog_task is not None and not self._catalog_task.done():
+            self._catalog_task.cancel()
+            await asyncio.gather(self._catalog_task, return_exceptions=True)
         if self._ws_task is not None and not self._ws_task.done():
             self._ws_task.cancel()
             await asyncio.gather(self._ws_task, return_exceptions=True)

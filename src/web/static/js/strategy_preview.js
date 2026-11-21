@@ -2,12 +2,14 @@
 (() => {
     'use strict';
     const defaults={method:'quantile',window_seconds:3600,quantile:90,multiplier:2,min_samples:30,
-        min_width_bps:0,max_width_bps:0,lower_bps:-20,upper_bps:20,exit_mode:'reversion',reversion_percent:60};
+        min_width_bps:0,max_width_bps:0,lower_bps:-20,upper_bps:20,exit_mode:'reversion',reversion_percent:60,
+        touch_tolerance_bps:2,touch_min_count:3};
     const fields={method:'channel-method',window_seconds:'channel-window',quantile:'channel-quantile',
         multiplier:'channel-multiplier',min_samples:'channel-min-samples',min_width_bps:'channel-min-width',
         max_width_bps:'channel-max-width',lower_bps:'channel-lower',upper_bps:'channel-upper',
-        exit_mode:'channel-exit-mode',reversion_percent:'channel-reversion'};
-    const methods={quantile:'历史分位',bollinger:'布林带',robust:'稳健通道',fixed:'固定区间'};
+        exit_mode:'channel-exit-mode',reversion_percent:'channel-reversion',
+        touch_tolerance_bps:'channel-touch-tolerance',touch_min_count:'channel-touch-count'};
+    const methods={quantile:'历史分位',touches:'反复触碰',bollinger:'布林带',robust:'稳健通道',fixed:'固定区间'};
     const names={arcus:'Arcus',lighter:'Lighter 主网',lighter_rh:'Lighter RH',standx:'StandX'};
     const get=id=>document.getElementById(id);
     const finite=value=>typeof value==='number'&&Number.isFinite(value);
@@ -72,13 +74,23 @@
             {name:'平仓候选\n仍需净盈利',coord:[5,rule.upperExit],itemStyle:{color:'#65e1c0'}},
             {name:'下侧入场\nA 空 / B 多',coord:[8,rule.values[8]],itemStyle:{color:'#8ca6ff'}},
             {name:'平仓候选\n仍需净盈利',coord:[10,rule.lowerExit],itemStyle:{color:'#65e1c0'}}]:[];
+        const touches=(frozen||preview?.bounds)?.touch_statistics;
+        const zones=touches?['upper','lower'].filter(side=>touches[side]).map(side=>[
+            {name:(side==='upper'?'上沿':'下沿')+' · '+touches[side].count+' 次独立触碰',
+                yAxis:touches[side].low_bps,itemStyle:{color:side==='upper'?'#e9ad7020':'#8ca6ff20'}},
+            {yAxis:touches[side].high_bps}]):[];
         chart.setOption({animation:false,backgroundColor:'transparent',grid:{left:root.clientWidth<500?48:65,right:20,top:48,bottom:45},
             tooltip:{trigger:'axis',valueFormatter:v=>finite(v)?v.toFixed(3)+' bps':v},
             xAxis:historical?{type:'time',splitNumber:4,axisLabel:{color:'#a8b8ca',hideOverlap:true}}:{type:'category',data:rule.values.map((_,i)=>i+1),name:'示意过程',nameLocation:'middle',nameGap:20,axisLabel:{show:false}},
             yAxis:{type:'value',scale:true,name:'价差 / bps',nameTextStyle:{color:'#a8b8ca'},axisLabel:{color:'#a8b8ca'},splitLine:{lineStyle:{color:'#263347'}}},
             series:[{type:'line',name:historical?'历史价差':'规则示意（非真实行情）',showSymbol:false,lineStyle:{color:'#55d9ba',width:2},
                 data:historical?points.map(p=>[p.timestamp*1000,p.value_bps]):rule.values,
-                markLine:{silent:true,symbol:'none',data:lines},markPoint:{symbol:'circle',symbolSize:10,label:{show:true,formatter:'{b}',color:'#e6eef8',position:'top',fontSize:11},data:marks}}]},true);
+                markArea:{silent:true,data:zones},
+                markLine:{silent:true,symbol:'none',data:lines},markPoint:{symbol:'circle',symbolSize:10,label:{show:true,formatter:'{b}',color:'#e6eef8',position:'top',fontSize:11},data:marks}},
+                ...(historical&&touches?['upper','lower'].filter(side=>touches[side]).map(side=>({
+                    type:'scatter',name:(side==='upper'?'上沿':'下沿')+'独立触碰',symbolSize:7,
+                    itemStyle:{color:side==='upper'?'#e9ad70':'#8ca6ff'},
+                    data:touches[side].points.map(p=>[p.timestamp*1000,p.value_bps])})):[])]},true);
         const desc=channel?`${p.exit_mode==='opposite'?'到冻结对侧边界且净盈利后并发平仓；双边确认结束，再核验最新反向机会。':`入场后向冻结中心回归 ${p.reversion_percent}%，并且实际可成交净收益达标才正常平仓。`} 上边界 A 多 B 空，下边界 A 空 B 多。`:
             `当前使用${config.entry_policy?.mode==='adaptive_quantile'?'历史分位加':''}净回归空间门槛。正常退出按已保存的平仓触发方式，核验实际净收益。`;
         const close=config.close_policy||{};
@@ -86,7 +98,9 @@
             get('strategy-preview-description').textContent='旧仓冻结方向目标 '+(frozenPosition.entry_target?.target_bps??'未知')+' bps；方向价差图请查看订单详情。旧记录缺完整保护参数，无法还原全部设置。';
             return;
         }
-        get('strategy-preview-description').textContent=(historical?preview?.chart_note||'等待本地历史。':'假设走势示意，触边仍需执行核验。 ')+desc+
+        get('strategy-preview-description').textContent=(channel&&p.method==='touches'
+            ? `上下沿各需 ${p.touch_min_count} 次独立触碰；容差 ${p.touch_tolerance_bps} bps。${p.window_seconds>604800?'触碰只取最近 7 天原始转折。':''}`:'')+
+            (historical?preview?.chart_note||'等待本地历史。':'假设走势示意，触边仍需执行核验。 ')+desc+
             ` 最低平仓净盈利 ${close.min_profit_usdc??0} USDC / ${close.min_profit_bps??0} bps，另加成本预留 ${close.cost_reserve_usdc??0} USDC。`+
             (close.max_hold_seconds?` 最长持仓 ${close.max_hold_seconds/60} 分钟触发保护，可能亏损。`:' 未设置最长持仓时限。')+
             (config.risk?.max_loss_per_trade!=null?` 单笔亏损保护 ${config.risk.max_loss_per_trade} USDC，可能亏损退出。`:' 未设置固定金额止损。')+
@@ -147,6 +161,41 @@
     window.StrategyChannelUI={load,read,validate,open,basis:()=>({mode:saved.entry_policy?.mode||'fixed',policy:{...defaults,...saved.channel_policy}})};
     document.addEventListener('DOMContentLoaded',()=>{
         const dialog=get('strategy-preview-dialog');if(!dialog)return;fill(defaults);
+        const help=document.createElement('div');help.id='channel-field-help';
+        help.className='field-help-tooltip';help.setAttribute('role','tooltip');help.hidden=true;
+        dialog.appendChild(help);
+        let helpOwner=null;
+        const hideHelp=()=>{
+            if(helpOwner){helpOwner.setAttribute('aria-expanded','false');helpOwner.removeAttribute('aria-describedby');}
+            helpOwner=null;help.hidden=true;
+        };
+        const showHelp=button=>{
+            hideHelp();
+            const rect=button.getBoundingClientRect(),bounds=dialog.getBoundingClientRect();
+            const leftEdge=Math.max(8,bounds.left+8),rightEdge=Math.min(window.innerWidth-8,bounds.right-8);
+            const topEdge=Math.max(8,bounds.top+8),bottomEdge=Math.min(window.innerHeight-8,bounds.bottom-8);
+            if(rect.bottom<topEdge||rect.top>bottomEdge||rightEdge-leftEdge<40)return;
+            help.textContent=button.dataset.tooltip;help.style.width=`${Math.min(280,rightEdge-leftEdge)}px`;
+            help.style.maxHeight=`${bottomEdge-topEdge}px`;help.style.visibility='hidden';help.hidden=false;
+            const size=help.getBoundingClientRect();
+            const left=Math.max(leftEdge,Math.min(rect.left,rightEdge-size.width));
+            const preferred=rect.bottom+7+size.height<=bottomEdge?rect.bottom+7:rect.top-7-size.height;
+            help.style.left=`${left}px`;help.style.top=`${Math.max(topEdge,Math.min(preferred,bottomEdge-size.height))}px`;
+            help.style.visibility='visible';helpOwner=button;
+            button.setAttribute('aria-expanded','true');button.setAttribute('aria-describedby',help.id);
+        };
+        dialog.querySelectorAll('.field-help-icon').forEach(button=>{
+            button.addEventListener('mouseenter',()=>showHelp(button));
+            button.addEventListener('mouseleave',hideHelp);
+            button.addEventListener('focus',()=>{if(button.matches(':focus-visible'))showHelp(button);});
+            button.addEventListener('blur',hideHelp);
+            button.addEventListener('click',event=>{event.preventDefault();event.stopPropagation();});
+            button.addEventListener('keydown',event=>{
+                if(event.key==='Escape'){event.preventDefault();event.stopPropagation();hideHelp();}
+            });
+        });
+        dialog.addEventListener('scroll',hideHelp,true);dialog.addEventListener('close',hideHelp);
+        window.addEventListener('resize',hideHelp);
         // A running panel may retain the prior template until its next restart.
         document.querySelectorAll('.strategy-preview-toolbar,.strategy-preview-tabs').forEach(node=>node.remove());
         get('channel-settings-open').addEventListener('click',()=>open(true));get('strategy-preview-open').addEventListener('click',()=>open(false));

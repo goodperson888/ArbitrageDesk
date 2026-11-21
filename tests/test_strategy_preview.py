@@ -49,7 +49,7 @@ class StrategyPreviewTests(unittest.TestCase):
             result=strategy_preview(self.history,self.payload,self.root)
         self.assertFalse(result['orders_submitted']);self.assertIsNone(result['error'])
         self.assertEqual(result['axis_venues'],['arcus','lighter'])
-        self.assertEqual([p['value_bps'] for p in result['points']],[3,1])
+        self.assertEqual([p['value_bps'] for p in result['points']],[3/1.0003,1/1.0001])
         self.assertEqual(result['positions'][0]['entry_target'],saved['positions'][0]['entry_target'])
         self.assertEqual(path.read_bytes(),before)
 

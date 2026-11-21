@@ -20,6 +20,19 @@ from src.lighter.execution import LighterExecutionAdapter
 
 
 class SnapshotCacheTests(unittest.TestCase):
+    def test_fresh_cache_bypasses_busy_reader_and_miss_has_bounded_lock_wait(self):
+        read=Mock(return_value={})
+        cache=AccountSnapshotCache(read,lambda:'account')
+        first=cache.refresh()
+        cache.read_lock=Mock()
+        self.assertEqual(cache.refresh(),first)
+        cache.read_lock.acquire.assert_not_called()
+        cache.invalidate(); cache.read_lock.acquire.return_value=False
+        with self.assertRaisesRegex(ValueError,'后台重试'):
+            cache.refresh()
+        cache.read_lock.acquire.assert_called_once_with(timeout=2)
+        self.assertEqual(read.call_count,1)
+
     def test_query_age_begins_before_io_and_does_not_reset_on_access(self):
         clock = [100.0]
         def slow():
@@ -250,6 +263,28 @@ class AccountAdapterTests(unittest.TestCase):
                         adapter.resize_entry_precheck('BTC',9,'buy')
                         self.assertTrue(adapter.consume_entry_precheck('BTC',9,'buy',{'bid':99,'ask':100}))
                         adapter.release_entry_precheck()
+
+    def test_capital_reserve_and_slot_split_reuse_account_evidence(self):
+        for factory in (self.lighter,self.arcus):
+            with self.subTest(venue=factory.__name__):
+                adapter=factory(); self.attach(adapter)
+                policy=dict(capital_reserve_percent=20,capital_reserve_usdc=100,
+                            capital_allocation_mode='remaining_slots',remaining_slots=2)
+                with patch.object(adapter,'read_entry_account_state',side_effect=AssertionError('extra read')):
+                    with self.history.execution_scope('capital-resize'):
+                        size=adapter.precheck_order('BTC',20,'buy',allow_resize=True,
+                            reference_price=100,quantity_step='.001',cost_bps=10,capital_policy=policy)
+                        self.assertEqual(float(size),3.996)
+                        self.assertTrue(adapter.consume_entry_precheck('BTC',size,'buy',{'bid':99,'ask':100}))
+                        # Invalidated proof falls back to ordinary account
+                        # validation; it must still respect this budget.
+                        with self.assertRaisesRegex(ValueError,'保证金'):
+                            adapter.validate_order('BTC',5,side='buy',account_state=adapter._account_snapshot_cache.get()[0])
+                        adapter.release_entry_precheck()
+                    with self.history.execution_scope('reserved-out'):
+                        with self.assertRaisesRegex(ValueError,'资金预留后额度不足'):
+                            adapter.precheck_order('BTC',20,'buy',allow_resize=True,
+                                reference_price=100,quantity_step='.001',capital_policy=dict(capital_reserve_usdc=1000))
 
     def test_cached_balance_still_limits_quantity_and_grid_checks_remain(self):
         adapter = self.lighter([{'market_id': 1, 'position': '1', 'sign': 1}])

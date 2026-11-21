@@ -52,11 +52,12 @@ def attach_return_previews(rows, history, policy, target_mode='center', window=6
         inputs = row.return_inputs
         channel,p,channel_error = None,None,None
         if policy.get('_entry_mode') == 'channel':
-            from src.execution.channel_policy import channel_policy,channel_bounds,channel_context
+            from src.execution.channel_policy import channel_policy,channel_bounds,channel_context,channel_stats_for
             try:
                 p = channel_policy({'channel_policy':policy.get('_channel_policy',{})})
                 axis = sorted([row.buy_venue,row.sell_venue])
-                stats = center_stats_for(history,row.canonical_symbol,'->'.join(axis),p['window_seconds'],p['quantile'])
+                stats = (channel_stats_for(history,row.canonical_symbol,'->'.join(axis),p) if p['method']=='touches' else
+                         center_stats_for(history,row.canonical_symbol,'->'.join(axis),p['window_seconds'],p['quantile']))
                 a,b = ((inputs.get('buy',{}),inputs.get('sell',{})) if row.buy_venue==axis[0]
                     else (inputs.get('sell',{}),inputs.get('buy',{})))
                 channel = channel_context(p,channel_bounds(p,stats),a,b,

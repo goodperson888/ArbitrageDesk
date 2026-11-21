@@ -15,7 +15,7 @@ import math
 import queue
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from decimal import Decimal
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -23,7 +23,7 @@ from typing import Any, Dict, Optional
 import httpx
 
 from src.common.comparison import depth_price
-from src.common.market_data import age_seconds, normalize_quote_time
+from src.common.market_data import age_seconds, normalize_quote_time, cached_quote_time
 from src.common.rate_limit import RateLimitGate
 from src.common.discovery import DiscoveryCooldown
 from src.execution.orders import (decimal, direction, fresh_quote, unknown,
@@ -345,6 +345,60 @@ class _ArcusWebSocket:
             self._thread.join(3)
 
 
+class _AccountReadFlights:
+    """Share GETs; only passive monitoring may reuse a subsecond snapshot."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.epoch = 0
+        self.pending = {}
+        self.monitor_cache = {}
+
+    def invalidate(self):
+        with self.lock:
+            self.epoch += 1
+            self.monitor_cache.clear()
+
+    def read(self, path, reader, revision):
+        return self._read(path, reader, revision, monitor=False)[0]
+
+    def read_monitor(self, path, reader, revision):
+        return self._read(path, reader, revision, monitor=True)
+
+    def _read(self, path, reader, revision, *, monitor):
+        with self.lock:
+            token = self.epoch, revision()
+            cached = self.monitor_cache.get(path)
+            if monitor and cached and cached[0] == token and 0 <= time.monotonic()-cached[1] <= .5:
+                return copy.deepcopy(cached[2])
+            key = path, token
+            future = self.pending.get(key)
+            owner = future is None
+            if owner:
+                future = self.pending[key] = Future()
+                started, observed_at = time.monotonic(), _iso_now()
+        if owner:
+            try:
+                value = reader(), observed_at
+                with self.lock:
+                    if token == (self.epoch, revision()):
+                        self.monitor_cache[path] = token, started, value
+                future.set_result(value)
+            except Exception as exc:
+                with self.lock:
+                    self.monitor_cache.pop(path, None)
+                future.set_exception(exc)
+            finally:
+                with self.lock:
+                    self.pending.pop(key, None)
+        # A slow owner cannot hold another caller indefinitely. No retry is
+        # made here; the normal monitor can recover on a later cycle.
+        value = future.result(timeout=3)
+        with self.lock:
+            if token != (self.epoch, revision()):
+                raise ValueError('Arcus 账户读取期间状态已变化，请重新核对')
+        return copy.deepcopy(value)
+
+
 class ArcusClient:
     """Signed Arcus REST/WS client. It never submits during construction."""
     def __init__(self, wallet_address: str, account_index: int, api_signing_key: str,
@@ -358,7 +412,13 @@ class ArcusClient:
         self.api_key = self.signing_key.public_key().public_bytes_raw().hex()
         self.base_url, self.ws_url, self.proxy_url = base_url.rstrip("/"), ws_url, proxy_url
         self.order_timeout = float(order_timeout)
-        self.http = httpx.Client(timeout=httpx.Timeout(12.0, connect=5.0), proxy=proxy_url)
+        self.http = httpx.Client(timeout=httpx.Timeout(12.0, connect=5.0), proxy=proxy_url,
+                                 trust_env=False)
+        # Account monitoring must not queue behind public market scans. Order
+        # submission stays on WS and receipt recovery keeps its existing pool.
+        self.account_http = httpx.Client(
+            timeout=httpx.Timeout(3., connect=2., pool=.5), proxy=proxy_url, trust_env=False,
+            limits=httpx.Limits(max_connections=8, max_keepalive_connections=4, keepalive_expiry=5.))
         self.ws = _ArcusWebSocket(ws_url, proxy_url, wallet_address, self.account_index)
         self._markets = {}
         self._markets_at = 0.0
@@ -366,6 +426,20 @@ class ArcusClient:
         self._public_cache = {}
         self._public_cache_lock = threading.RLock()
         self._public_key_locks = tuple(threading.RLock() for _ in range(32))
+        self._account_reads = _AccountReadFlights()
+
+    def _account_get(self, path):
+        params = {"address": self.wallet_address, "accountIndex": self.account_index}
+        reads = getattr(self, '_account_reads', None)
+        if reads is None:
+            return self._get(path, params)
+        return reads.read(path, lambda: self._get(path, params),
+                          lambda: (self.ws._ready.is_set(), self.ws.account_revision))
+
+    def _account_changed(self):
+        reads = getattr(self, '_account_reads', None)
+        if reads is not None:
+            reads.invalidate()
 
     def _get(self, path, params=None, ttl=0, discovery=False):
         if ttl:
@@ -384,6 +458,7 @@ class ArcusClient:
                 result = self._get(path, params, discovery=discovery)
                 if isinstance(result, dict):
                     result['_local_fetched_at'] = _iso_now()
+                    result['_local_fetched_monotonic'] = time.monotonic()
                 with self._public_cache_lock:
                     if len(self._public_cache) >= 256:
                         self._public_cache.clear()
@@ -393,9 +468,13 @@ class ArcusClient:
         if discovery:
             from src.execution.preparation import is_preparing
             self.rate_limit.reserve_discovery(priority=is_preparing())
-        response = self.http.get(self.base_url + path, params=params,
+        options = ({'timeout':httpx.Timeout(3.,connect=2.,pool=.5)}
+                   if path in ('/v1/account','/v1/positions','/v1/orders') else {})
+        transport = (getattr(self, 'account_http', self.http)
+                     if path in ('/v1/account', '/v1/positions') else self.http)
+        response = transport.get(self.base_url + path, params=params,
                                  headers={"X-API-Key": self.api_key,
-                                          "Content-Type": "application/json"})
+                                          "Content-Type": "application/json"}, **options)
         self.rate_limit.reject(response)
         response.raise_for_status()
         return response.json() if response.content else {}
@@ -457,11 +536,15 @@ class ArcusClient:
             try:
                 candidate = datetime.fromtimestamp(stamp / 1e6, timezone.utc)
                 exchange_observed = candidate.isoformat()
-                candidate = normalize_quote_time(candidate, observed)
-                if (observed - candidate).total_seconds() < 120: observed = candidate
+                candidate = normalize_quote_time(candidate, observed,
+                    received_monotonic=payload.get('_local_fetched_monotonic'))
+                observed = candidate
             except (OverflowError, OSError, ValueError): pass
+        received_mono = payload.get('_local_fetched_monotonic')
+        effective_mono = (received_mono-(datetime.fromisoformat(payload['_local_fetched_at'])-observed).total_seconds()
+                          if received_mono is not None else None)
         return {"market": market, "bid": bp, "bid_size": bs, "ask": ap, "ask_size": ass,
-                "updated_at": observed.isoformat(), "exchange_updated_at": exchange_observed,
+                "updated_at": cached_quote_time(observed.isoformat(),effective_mono), "exchange_updated_at": exchange_observed,
                 "received_at": payload.get('_local_fetched_at') or _iso_now()}
 
     def orderbook(self, symbol, discovery=False):
@@ -480,18 +563,29 @@ class ArcusClient:
         return {"symbol": _market_base(symbol), "fetched_at": updated, "bids": bids, "asks": asks}
 
     def account(self):
-        payload = self._get("/v1/account", {"address": self.wallet_address, "accountIndex": self.account_index})
+        payload = self._account_get("/v1/account")
         if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
             return payload["data"]
         return payload
 
     def positions(self):
-        payload = self._get("/v1/positions", {"address": self.wallet_address, "accountIndex": self.account_index})
+        payload = self._account_get("/v1/positions")
         if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
             return payload["data"]
         return payload
 
+    def monitor_positions(self):
+        params = {"address": self.wallet_address, "accountIndex": self.account_index}
+        payload, observed_at = self._account_reads.read_monitor(
+            '/v1/positions', lambda: self._get('/v1/positions', params),
+            lambda: (self.ws._ready.is_set(), self.ws.account_revision))
+        if isinstance(payload, dict) and isinstance(payload.get('data'), dict):
+            payload = payload['data']
+        return payload, observed_at
+
     def orders(self):
+        # Terminal order recovery must remain independent of account refresh
+        # notifications: a fill can arrive while this collection is read.
         return self._get("/v1/orders", {"address": self.wallet_address, "accountIndex": self.account_index})
 
     def order_status(self, order_id, *, collection_only=False):
@@ -534,8 +628,12 @@ class ArcusClient:
                                               side, price, quantity, market["tick_size"], market["step_size"],
                                               client_order_id, reduce_only=reduce_only,
                                               tick_tiers=market.get('tick_tiers'))
-        response = self.ws.rpc("placeOrder", body, typed, self.signing_key, self.api_key, ts,
-                               timeout=self.order_timeout, submit_deadline_monotonic=submit_deadline_monotonic)
+        self._account_changed()
+        try:
+            response = self.ws.rpc("placeOrder", body, typed, self.signing_key, self.api_key, ts,
+                                   timeout=self.order_timeout, submit_deadline_monotonic=submit_deadline_monotonic)
+        finally:
+            self._account_changed()
         status = str(response.get("status", ""))
         if status not in ("200", "202"):
             error = response.get("error") or response.get("message") or "Arcus 下单被拒"
@@ -550,8 +648,12 @@ class ArcusClient:
         market = self.market(symbol)
         typed, body, ts = build_cancel_payload(self.wallet_address, self.account_index,
                                                 market["market_id"], str(order_id))
-        response = self.ws.rpc("cancelOrder", body, typed, self.signing_key, self.api_key, ts,
-                               timeout=self.order_timeout)
+        self._account_changed()
+        try:
+            response = self.ws.rpc("cancelOrder", body, typed, self.signing_key, self.api_key, ts,
+                                   timeout=self.order_timeout)
+        finally:
+            self._account_changed()
         status = str(response.get("status", ""))
         return {"accepted": status in ("200", "202"), "response": response,
                 "error": response.get("error") or response.get("message")}
@@ -559,6 +661,8 @@ class ArcusClient:
     def close(self):
         self.ws.close()
         self.http.close()
+        if getattr(self, 'account_http', None) is not None:
+            self.account_http.close()
 
 
 class ArcusExecutionAdapter(EntryPrecheckMixin):
@@ -884,6 +988,15 @@ class ArcusExecutionAdapter(EntryPrecheckMixin):
         snapshot['fetched_at'] = _iso_now()
         return snapshot
 
+    def monitor_position_snapshot(self, symbol):
+        """Project one shared account read without renewing its observation time."""
+        payload, observed_at = self.client.monitor_positions()
+        if not isinstance(payload, dict) or not isinstance(payload.get('positions'), (list, dict)):
+            raise ValueError('Arcus 全账户持仓集合缺失')
+        snapshot = self._position(symbol, payload)
+        snapshot['fetched_at'] = observed_at
+        return snapshot
+
     @staticmethod
     def _order_rows(payload):
         """Return the account's order rows without treating history as active.
@@ -973,7 +1086,15 @@ class ArcusExecutionAdapter(EntryPrecheckMixin):
         if not reduce_only and (amount < decimal(market["min_base_amount"] or 0) or
                                 amount * reference_price < decimal(market["min_quote_amount"] or 0)):
             raise ValueError("未满足 Arcus 最小下单数量或金额")
-        if account_state is None or reduce_only:
+        if reduce_only:
+            # Closing needs position and live-order evidence, not free
+            # collateral. A slow balance GET must not age the exit quote.
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                active_future = pool.submit(self._active_orders, symbol)
+                position_future = pool.submit(self._position, symbol)
+                active_orders, position = active_future.result(), position_future.result()
+            account = {}
+        elif account_state is None:
             with ThreadPoolExecutor(max_workers=3) as pool:
                 account_future = pool.submit(self.client.account)
                 active_future = pool.submit(self._active_orders, symbol)
@@ -997,7 +1118,7 @@ class ArcusExecutionAdapter(EntryPrecheckMixin):
         if not reduce_only:
             if free is None:
                 raise ValueError("Arcus 账户可用保证金字段缺失，未发送订单")
-            if decimal(free) < amount * reference_price:
+            if self.entry_capital_balance(free, symbol, side) < amount * reference_price:
                 raise ValueError("Arcus 可用保证金不足以覆盖保守的一倍名义金额")
             return {'available_balance': str(free), 'min_base_amount': market['min_base_amount'],
                     'min_quote_amount': market['min_quote_amount']}
@@ -1082,7 +1203,18 @@ class ArcusExecutionAdapter(EntryPrecheckMixin):
             return {"success": False, "confirmed": True, "status": "rejected", "filled_size": 0,
                     "submitted": False, "error": self.live_blocker}
         with self.lock:
-            fresh_quote(quote, _market_base(symbol), size)
+            try:
+                fresh_quote(quote, _market_base(symbol), size)
+            except SubmissionWindowExpired as exc:
+                # No intent, signing or transport has happened at this point.
+                # The close coordinator can safely re-evaluate a zero-fill
+                # exit rather than halting all monitoring as receipt-unknown.
+                # A repeated client id could belong to an earlier send, so
+                # only a new identity can be classified as definitely unsent.
+                if self.journal.find(self.venue, self.account, client_order_id):
+                    return unknown('提交意图已存在，禁止重发，需核对原订单')
+                return {'success': False, 'confirmed': True, 'status': 'rejected',
+                        'filled_size': 0, 'submitted': False, 'error': str(exc)}
             normalized = direction(side)
             if decimal(price) != decimal(quote["ask" if normalized == "buy" else "bid"]):
                 raise ValueError("Arcus 价格与本次报价不符")
@@ -1103,7 +1235,8 @@ class ArcusExecutionAdapter(EntryPrecheckMixin):
             order_id = None
             try:
                 try:
-                    if not self.consume_entry_precheck(symbol, size, normalized, quote, reduce_only):
+                    close_checked = reduce_only and self._consume_close_precheck(symbol, size, normalized, quote)
+                    if not close_checked and not self.consume_entry_precheck(symbol, size, normalized, quote, reduce_only):
                         self.validate_order(symbol, size, reduce_only, normalized)
                     # Account reads may take several seconds. A quote that
                     # was fresh on entry must still be fresh at submission.
@@ -1151,12 +1284,68 @@ class ArcusExecutionAdapter(EntryPrecheckMixin):
             self.journal.finish(row["seq"], result)
             return result
 
+    def _consume_close_precheck(self, symbol, size, side, quote):
+        proof = getattr(self, '_close_precheck', None)
+        self._close_precheck = None  # A single exact quote/order can consume it.
+        return bool(proof is not None and proof[0] is quote
+                    and proof[1:4] == (_market_base(symbol), decimal(size, True), direction(side))
+                    and 0 <= time.monotonic() - proof[4] <= self.precheck_max_age
+                    and proof[5] == self.account_snapshot_revision())
+
+    def close_position_from_quote(self, symbol, side, size, client_order_id, quote,
+                                  reduce_only=True, slippage_bps=10):
+        return self._close_after_account_check(symbol, side, size, client_order_id,
+            reduce_only, slippage_bps, quote)
+
     def close_position(self, symbol, side, size, client_order_id, reduce_only=True, slippage_bps=10):
-        quote = self.get_executable_quote(symbol, size)
-        close_side = "sell" if direction(side) == "buy" else "buy"
-        price = quote["bid"] if close_side == "sell" else quote["ask"]
-        return self.place_order(symbol, close_side, size, price, slippage_bps,
-                                client_order_id, quote, reduce_only=reduce_only)
+        return self._close_after_account_check(symbol, side, size, client_order_id,
+            reduce_only, slippage_bps)
+
+    def _close_after_account_check(self, symbol, side, size, client_order_id,
+                                   reduce_only, slippage_bps, quote=None):
+        # Residual/forced exits can refresh their reference inside the user's
+        # slippage cap. Profit-guarded paired exits call place_order directly
+        # and keep the original group-approved protective prices.
+        with self.lock:
+            if not reduce_only:
+                raise ValueError('平仓必须使用只减仓订单')
+            if not self.live_ready:
+                return {'success': False, 'confirmed': True, 'status': 'rejected',
+                        'filled_size': 0, 'submitted': False, 'error': self.live_blocker}
+            previous = self.journal.find(self.venue, self.account, client_order_id)
+            if previous:
+                return json.loads(previous['result']) if previous.get('result') else unknown('提交意图已存在，禁止重发')
+            close_side = 'sell' if direction(side) == 'buy' else 'buy'
+            checked_at = time.monotonic()
+            revision = self.account_snapshot_revision()
+            try:
+                self.validate_order(symbol, size, reduce_only=True, side=close_side)
+            except Exception as exc:
+                return {'success': False, 'confirmed': True, 'status': 'rejected',
+                        'filled_size': 0, 'submitted': False,
+                        'error': '提交前账户检查失败，未发送订单：' + str(exc)}
+            # Reuse a newer, size-covered native book without another REST
+            # request. An older prefetched quote cannot replace newer ticks.
+            book = self.cached_sizing_book(symbol, float(size))
+            if book is not None:
+                age = age_seconds(quote.get('updated_at')) if quote else None
+                book_age = age_seconds(book.get('fetched_at'))
+                if age is None or book_age is not None and 0 <= book_age < age:
+                    try:
+                        quote = self.quote_from_sizing_book(symbol, size, book)
+                    except (ValueError, KeyError, TypeError, ArithmeticError):
+                        pass
+            age = age_seconds(quote.get('updated_at')) if quote else None
+            if age is None or not 0 <= age <= 2:
+                quote = self.get_executable_quote(symbol, size)
+            self._close_precheck = (quote, _market_base(symbol), decimal(size, True),
+                                    close_side, checked_at, revision)
+            try:
+                price = quote['bid'] if close_side == 'sell' else quote['ask']
+                return self.place_order(symbol, close_side, size, price, slippage_bps,
+                                        client_order_id, quote, reduce_only=True)
+            finally:
+                self._close_precheck = None
 
     def assert_flat(self, symbol):
         position = self._position(symbol)

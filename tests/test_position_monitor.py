@@ -5,6 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
+import httpx
 from concurrent.futures import Future
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -44,6 +45,105 @@ class Reader:
 
 
 class PositionMonitorTests(unittest.TestCase):
+    def test_pool_exhaustion_has_bounded_fast_recovery_and_clears_diagnostics(self):
+        self.monitor.positions = [self.p]
+        generation = self.monitor._generation([self.p])
+        self.monitor.generations['SUI'] = generation
+        key = ('account', 'SUI', 'lighter')
+        for i, delay in enumerate((1, 2, 4, 5)):
+            failed = Future()
+            failed.set_exception(httpx.PoolTimeout('secret signed URL must not appear'))
+            self.monitor.jobs[key] = failed, generation
+            with patch('src.execution.position_monitor.time.monotonic', return_value=100+i):
+                self.monitor._collect()
+                health = self.monitor._account_health('SUI', 'lighter')
+            self.assertEqual(self.monitor.next_read[key], 100+i+delay)
+            self.assertEqual(health['blocked_for_seconds'], i)
+            self.assertIn('PoolTimeout', health['error'])
+            self.assertNotIn('secret', health['error'])
+        ready = Future()
+        ready.set_result(dict(qty=1, fetched_at=utc_now()))
+        self.monitor.jobs[key] = ready, generation
+        self.monitor._collect()
+        self.assertEqual(self.monitor._account_health('SUI', 'lighter')['status'], 'ready')
+        self.assertNotIn(key, self.monitor.error_since)
+
+    def test_passive_monitor_reader_does_not_replace_foreground_position_reader(self):
+        with patch.object(Reader, 'monitor_position_snapshot', return_value={}, create=True) as passive, \
+                patch.object(self.monitor, '_submit') as submit:
+            self.monitor.poll([self.p], wait_for_reads=False)
+            callbacks = [call.args[2] for call in submit.call_args_list if call.args[0][0] == 'account']
+            self.assertEqual(len(callbacks), 2)
+            for reader in callbacks:
+                reader()
+        self.assertEqual(passive.call_count, 2)
+
+    def test_pending_account_diagnostics_name_venue_and_do_not_extend_stale_evidence(self):
+        self.monitor.positions = [self.p]
+        stamp = '2000-01-01T00:00:00Z'
+        self.seed('account', 'lighter', dict(qty=1, fetched_at=stamp))
+        self.monitor.errors[('account', 'SUI', 'lighter')] = '等待可用连接超时（PoolTimeout）'
+        self.monitor.publish()
+        row = json.loads(self.monitor.path.read_text())['positions'][0]
+        self.assertIn('Arcus：', row['account_errors'][0])
+        self.assertEqual(row['legs']['lighter']['account']['last_success_at'], stamp)
+        self.assertEqual(row['legs']['lighter']['account']['status'], 'pending')
+        with self.assertRaises(PositionReadUnavailable):
+            self.monitor.accounts('SUI')
+
+    def test_expired_read_is_discarded_and_does_not_spawn_duplicate_or_overwrite_recovery(self):
+        self.monitor.positions=[self.p]
+        generation=self.monitor._generation([self.p])
+        self.monitor.generations['SUI']=generation
+        key=('account','SUI','variational')
+        future=Future(); self.monitor.jobs[key]=(future,generation)
+        with patch('src.execution.position_monitor.time.monotonic',return_value=100):
+            self.monitor.job_started[key]=91
+            self.monitor._collect()
+            self.assertNotIn(key,self.monitor.jobs)
+            self.assertIn(future,self.monitor.expired_jobs)
+            self.assertEqual(self.monitor.next_read[key],105)
+            self.assertIn('超时',self.monitor.errors[key])
+            with patch('src.execution.position_monitor.threading.Thread.start') as start:
+                self.monitor._submit(key,generation,lambda:{})
+                start.assert_not_called()
+        future.set_result({'qty':999})
+        self.monitor._collect()
+        self.assertNotIn(key,self.monitor.values)
+        fresh=Future(); fresh.set_result(dict(qty=1,fetched_at=utc_now()))
+        self.monitor.jobs[key]=(fresh,generation); self.monitor._collect()
+        self.seed('account','lighter',dict(qty=1,fetched_at=utc_now()))
+        self.monitor.checked(self.p)
+        self.assertFalse(self.monitor.entry_blocked)
+
+    def test_read_concurrency_counts_running_expired_tasks_and_respects_rate_limit(self):
+        generation=self.monitor._generation([self.p]); self.monitor.generations['SUI']=generation
+        self.monitor.expired_jobs={Future():('account','OTHER',str(i)) for i in range(3)}
+        self.monitor.jobs[('account','SUI','variational')]=(Future(),generation)
+        with patch('src.execution.position_monitor.threading.Thread.start') as start:
+            self.monitor._submit(('account','SUI','lighter'),generation,lambda:{})
+            start.assert_not_called()
+        from src.common.rate_limit import RateLimitError
+        future=Future(); future.set_exception(RateLimitError(93))
+        key=('account','SUI','variational'); self.monitor.jobs[key]=(future,generation)
+        with patch('src.execution.position_monitor.time.monotonic',return_value=100):
+            self.monitor._collect()
+            self.assertEqual(self.monitor.next_read[key],193)
+        fresh=Future(); fresh.set_result(dict(qty=1,fetched_at=utc_now()))
+        self.monitor.jobs[key]=(fresh,generation); self.monitor._collect()
+        self.assertNotIn(key,self.monitor.errors)
+        self.assertNotIn(key,self.monitor.read_failures)
+
+    def test_transient_quote_and_exit_failure_preserves_fast_close_retry_cadence(self):
+        generation=self.monitor._generation([self.p]);self.monitor.generations['SUI']=generation
+        for kind,leg,delay in (('quote','variational',.5),('grid',self.p.id,1)):
+            for i in range(4):
+                future=Future();future.set_exception(ValueError('报价过期'))
+                key=(kind,'SUI',leg);self.monitor.jobs[key]=(future,generation)
+                with patch('src.execution.position_monitor.time.monotonic',return_value=100):
+                    self.monitor._collect()
+                self.assertEqual(self.monitor.next_read[key],100+delay)
+
     def test_exit_refresh_is_scheduled_before_original_quote_deadline(self):
         generation = self.monitor._generation([self.p])
         self.monitor.generations['SUI'] = generation
@@ -143,6 +243,28 @@ class PositionMonitorTests(unittest.TestCase):
         self.monitor.generations['SUI'] = self.monitor._generation([self.p])
         self.monitor.values[(kind, 'SUI', leg)] = (
             value, time.monotonic(), self.monitor.generations['SUI'])
+
+    def test_unknown_close_keeps_quote_and_account_reads_without_exit_estimates(self):
+        self.p.status = 'reconcile_required'
+        self.s.halted_reason = '平仓回执需核对：TimeoutError'
+        with patch.object(self.monitor, '_submit') as submit:
+            self.monitor.poll([self.p], wait_for_reads=False)
+        self.assertEqual({call.args[0] for call in submit.call_args_list}, {
+            ('quote', 'SUI', 'variational'), ('quote', 'SUI', 'lighter'),
+            ('account', 'SUI', 'variational'), ('account', 'SUI', 'lighter')})
+        payload = json.loads(self.monitor.path.read_text())
+        self.assertTrue(payload['running'])
+        self.assertTrue(payload['read_only'])
+        self.assertTrue(payload['entry_paused'])
+        self.assertEqual(payload['stop_reason'], self.s.halted_reason)
+        self.assertEqual(payload['positions'][0]['status'], 'blocked')
+        self.assertEqual(payload['positions'][0]['position_status'], 'reconcile_required')
+
+    def test_pending_position_without_halt_does_not_start_background_order_reads(self):
+        self.p.status = 'reconcile_required'
+        with patch.object(self.monitor, '_submit') as submit:
+            self.monitor.poll([self.p], wait_for_reads=False)
+        submit.assert_not_called()
 
     def test_slow_accounts_do_not_block_quote_checks_or_allow_close(self):
         gate = threading.Event()

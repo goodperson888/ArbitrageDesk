@@ -1,8 +1,8 @@
 import unittest
 from datetime import datetime, timezone, timedelta
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 import requests
-from src.common.market_data import MarketDataError, number, age_seconds
+from src.common.market_data import MarketDataError, PublicClient, number, age_seconds
 from src.variational.public_client import VariationalPublicClient
 from src.lighter.api_trader import LighterApiTrader
 
@@ -31,6 +31,30 @@ def lighter_stats():
 
 
 class PublicDataTests(unittest.TestCase):
+    def test_account_request_timeout_bounds_transport_and_same_key_wait(self):
+        from src.execution.telemetry import safe_reason
+        for reason in ('只读请求等待超时，稍后重试','账户快照已有读取任务，等待后台重试','行情请求失败: PoolTimeout'):
+            self.assertEqual(safe_reason(MarketDataError(reason)),reason)
+        client=PublicClient('https://fixture.invalid',session=session_for({'code':200}))
+        client.rate_limit=Mock()
+        client.get('/account',ttl=0,request_timeout=3)
+        self.assertEqual(client.session.get.call_args.kwargs['timeout'],(3,3))
+        lock=Mock(); lock.acquire.return_value=False; client._key_locks=(lock,)
+        with self.assertRaisesRegex(MarketDataError,'等待超时'):
+            client.get('/account',ttl=0,request_timeout=3)
+        lock.acquire.assert_called_once_with(timeout=3)
+        self.assertEqual(client.session.get.call_count,1)
+
+    def test_httpx_account_request_has_small_pool_timeout(self):
+        import httpx
+        session=httpx.Client(transport=httpx.MockTransport(lambda request:httpx.Response(200,json={'code':200})))
+        self.addCleanup(session.close)
+        client=PublicClient('https://fixture.invalid',session=session);client.rate_limit=Mock()
+        with patch.object(session,'get',wraps=session.get) as get:
+            client.get('/account',ttl=0,request_timeout=3)
+        timeout=get.call_args.kwargs['timeout']
+        self.assertEqual((timeout.read,timeout.connect,timeout.pool),(3,2,.5))
+
     def test_variational_no_wallet_and_cache(self):
         session = session_for(stats())
         trader = VariationalPublicClient(session=session)

@@ -252,6 +252,20 @@ class ExecutionWorker:
         except (AttributeError, TypeError):
             return []
 
+    def _monitor_halted_positions(self):
+        """Keep read-only holdings telemetry alive; authorize no order calls."""
+        monitor = getattr(self.strategy, 'position_monitor', None)
+        reason = self.strategy.halted_reason
+        if not reason or monitor is None or not any(p.status != 'closed' for p in self._positions()):
+            return False
+        if getattr(self, '_readonly_halt_reason', None) != reason:
+            self.strategy.history.append('execution_reconciliation_waiting', reason=reason,
+                note='自动下单已暂停，保留持仓只读监控；停止本次执行后核对原订单再恢复')
+            self._readonly_halt_reason = reason
+        monitor.poll(self._positions())
+        monitor.publish_tick()
+        return True
+
     def _wait_cycle(self):
         """Do not add a whole interval AFTER the work has already taken it.
 
@@ -590,9 +604,12 @@ class ExecutionWorker:
             return None
         if not self._preparation_ready:
             return None
-        best = max(self._preparation_ready.values(), key=lambda item: (
-            item['plan'][0]['estimated_entry_edge_usdc'], item['plan'][0]['net_edge_bps'],
-            item.get('recency_rank', 0), item['prepared_at']))
+        def prepared_rank(item):
+            profit = item['plan'][0]['estimated_entry_edge_usdc']
+            quality = getattr(self.strategy, 'execution_quality_rank', None)
+            return (round(profit, 4), quality(item['opportunity']) if callable(quality) else .5,
+                    profit, item['plan'][0]['net_edge_bps'], item.get('recency_rank', 0), item['prepared_at'])
+        best = max(self._preparation_ready.values(), key=prepared_rank)
         del self._preparation_ready[best['opportunity'].symbol]
         return best
 
@@ -814,17 +831,25 @@ class ExecutionWorker:
                 recover = getattr(self.strategy, 'recover_single_leg_positions', None)
                 # A stop request is graceful: it blocks new entries, while
                 # an existing hedge remains under the normal close monitor.
-                # A strategy halt is different and must exit immediately for
-                # reconciliation.
+                # A halt locks all order paths. Keep read-only telemetry alive
+                # for remaining holdings until the user stops to reconcile.
                 if self.strategy.halted_reason:
-                    recovery_state = recover() if callable(recover) else 'blocked'
+                    same_halt = getattr(self, '_readonly_halt_reason', None) == self.strategy.halted_reason
+                    recovery_state = recover() if callable(recover) and not same_halt else 'blocked'
                     if recovery_state in ('recovered', 'waiting'):
                         cycles += 1
                         if max_cycles is not None and cycles >= max_cycles:
                             break
                         self._wait_cycle()
                         continue
+                    if self._monitor_halted_positions():
+                        cycles += 1
+                        if max_cycles is not None and cycles >= max_cycles:
+                            break
+                        self._wait_cycle()
+                        continue
                     break
+                self._readonly_halt_reason = None
                 # Existing positions are managed before discovering new entries.
                 monitor = getattr(self.strategy, 'position_monitor', None)
                 if monitor is not None:
@@ -836,6 +861,12 @@ class ExecutionWorker:
                     if state == 'halted':
                         recovery_state = recover() if callable(recover) else 'blocked'
                         if recovery_state in ('recovered', 'waiting'):
+                            cycles += 1
+                            if max_cycles is not None and cycles >= max_cycles:
+                                break
+                            self._wait_cycle()
+                            continue
+                        if self._monitor_halted_positions():
                             cycles += 1
                             if max_cycles is not None and cycles >= max_cycles:
                                 break

@@ -46,6 +46,9 @@ class HedgeSafetyTests(unittest.TestCase):
     def tearDown(self):
         from src.api_v2.center_statistics import close_service
         close_service(self.stats_history)
+        # Optional entry/close evidence is written asynchronously. Drain it
+        # before removing this test's database directory.
+        self.assertTrue(self.strategy.close_diagnostics.writer.flush(timeout=1))
         self.temp.cleanup()
 
     def test_equal_base_quantity_not_equal_notional(self):

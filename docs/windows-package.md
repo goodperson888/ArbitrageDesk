@@ -18,7 +18,7 @@
 
 ## 构建
 
-推送 `main` / `v*` 标签，或在 Actions 页面点击 Run workflow。构建机为 Windows x64，安装依赖、检查干净包后上传 ZIP，保留 14 天。失败不上传可用包；从对应步骤日志查看原因。
+在 GitHub 的 Actions 中选择 `Windows portable package`，点击 `Run workflow` 手动打包；推送代码或标签不会自动打包。构建机为 Windows x64，安装依赖、检查干净包后上传 ZIP，保留 14 天。失败不上传可用包；从对应步骤日志查看原因。
 
 `scripts/build_windows.py` 通过明确目录清单组装，排除运行目录；仅携带示例配置。Windows 首次启动由 `scripts/windows_launcher.py` 管理面板、API 及它们的子进程。现有 Mac 启停命令继续使用 `start.sh`。
 

@@ -104,6 +104,21 @@ class ParallelCloseTests(unittest.TestCase):
         self.assertLess(self.p.realized_pnl_usdc, 0, 'risk-reducing exit does not wait for a profit')
         self.assertNotEqual(self.b.calls[0]['client_order_id'], self.b.calls[1]['client_order_id'])
 
+    def test_only_residual_uses_adapter_refresh_hook_and_paired_close_keeps_approved_quote(self):
+        refreshed = []
+        def close_from_quote(symbol, side, size, **kwargs):
+            refreshed.append(dict(symbol=symbol, side=side, size=size, **kwargs))
+            return self.b.close_position(symbol, side, size, **kwargs)
+        self.b.close_position_from_quote = close_from_quote
+        self.b.responses = [dict(confirmed=True, status='canceled', filled_size=0, order_id='zero'),
+                            fill(2, 98, 'residual')]
+        self.assertTrue(self.s.close_position(self.p, '价差收敛'))
+        self.assertEqual(len(refreshed), 1)
+        self.assertEqual((refreshed[0]['symbol'], refreshed[0]['side'], refreshed[0]['size']), ('PUMP', 'buy', 2))
+        self.assertTrue(refreshed[0]['reduce_only'])
+        self.assertEqual(refreshed[0]['slippage_bps'], 7)
+        self.assertEqual(self.b.calls[0]['slippage_bps'], 2, 'first paired exit keeps the approved protection')
+
     def test_retry_account_read_overlaps_peer_receipt_but_does_not_send_early(self):
         account_read = threading.Event()
         release_peer = threading.Event()
@@ -187,6 +202,26 @@ class ParallelCloseTests(unittest.TestCase):
             reads.start(self.p, leg, quote=True)
             self.assertIsNone(reads.quote(self.p, leg))
         self.assertEqual(self.b.calls, [], 'a prefetched quote alone cannot send any order')
+
+    def test_residual_quote_is_started_before_coordinator_retry_validation(self):
+        quoted = threading.Event()
+        original_quote, verify = self.b.get_executable_quote, self.s._verify_close_retry
+        count = []
+        def quote(symbol, size):
+            count.append(size)
+            if len(count) > 1:
+                quoted.set()
+            return original_quote(symbol, size)
+        def verify_after_prefetch(*args, **kwargs):
+            self.assertTrue(quoted.wait(timeout=1), 'required quote starts before the retry-validation stage')
+            return verify(*args, **kwargs)
+        self.b.get_executable_quote = quote
+        self.b.responses = [dict(confirmed=True, status='canceled', filled_size=0, order_id='zero'),
+                            fill(2, 100, 'retry')]
+        with patch.object(self.s, '_verify_close_retry', side_effect=verify_after_prefetch):
+            self.assertTrue(self.s.close_position(self.p, '价差收敛'))
+        self.assertEqual(count, [2, 2])
+        self.assertEqual(self.b.snapshot_reads, 1)
 
     def test_unknown_peer_does_not_request_or_submit_a_residual_quote(self):
         with patch.object(self.b, 'get_executable_quote', wraps=self.b.get_executable_quote) as quotes:

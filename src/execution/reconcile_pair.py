@@ -21,12 +21,26 @@ from src.execution.orders import decimal
 from src.execution.grid_policy import layer_funding
 from src.arcus.execution import ArcusClient
 from src.execution.position_recovery import position_fingerprint, validate_paired_positions
+from src.execution.close_recovery import reconcile_unsent_closes, validate_resume_closes
 
 
 def _atomic_json(path, payload):
     temporary = path.with_suffix(path.suffix + '.tmp')
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
     os.replace(temporary, path)
+
+
+def _settle_flat_position(position, observed_at):
+    """Record account-proven closure without inventing missing fill evidence."""
+    position['reconciled_at'] = observed_at
+    position['reconciliation_note'] = '原平台该品种持仓与活动订单已只读核对为空；历史费用字段仍保留未知'
+    position['reconciled_sizes'] = {key: position.get(key, 0)
+                                    for key in ('variational_size', 'lighter_size')}
+    position.update(variational_size=0, lighter_size=0, status='closed')
+    if ((position.get('entry_size_variational') or position.get('entry_size_lighter')) and
+            (position.get('close_price_variational') is None or position.get('close_price_lighter') is None)):
+        position['accounting_pending'] = True
+        position['reconciliation_note'] = '原平台该品种已确认空仓；实际平仓成交与费用仍待历史核账'
 
 
 def _timestamp_ms(value):
@@ -174,7 +188,7 @@ def reconcile_pair(root, venues, state_venues=None):
                     market_id = row.get('marketId') or row.get('market_id')
                     if market_id is not None:
                         by_market[str(market_id)] = by_market.get(str(market_id), 0) + 1
-                positions = []
+                normalized_positions = []
                 for item in raw_positions:
                     if not isinstance(item, dict):
                         continue
@@ -182,7 +196,7 @@ def reconcile_pair(root, venues, state_venues=None):
                     side = str(item.get('side') or item.get('positionSide') or '').lower()
                     if side not in ('long', 'short'):
                         side = 'long' if decimal(size or 0) >= 0 else 'short'
-                    positions.append({
+                    normalized_positions.append({
                         'market_id': item.get('marketId') or item.get('market_id'),
                         'position': str(abs(decimal(size or 0))),
                         'sign': 1 if side == 'long' else -1,
@@ -190,7 +204,7 @@ def reconcile_pair(root, venues, state_venues=None):
                         'pending_order_count': 0,
                     })
                 account_snapshots[venue] = {
-                    'positions': positions,
+                    'positions': normalized_positions,
                     'pending_order_count': len(active_orders),
                 }
                 if active_orders:
@@ -267,6 +281,22 @@ def reconcile_pair(root, venues, state_venues=None):
                     if str(item.get('market_id')) == str(market.get('market_id')) and
                     decimal(item.get('position', '0')) != 0]
 
+        # A manually completed group must not strand another live group.
+        # Test each group's original markets before requiring paired local
+        # quantities; the stale row may contain just one remaining leg.
+        # Mutations stay in memory until the whole account scope validates.
+        closed_symbols = []
+        observed_at = utc_now()
+        for local in positions:
+            pair = [local.get('variational_venue'), local.get('lighter_venue')]
+            if not portfolio:
+                pair = venues
+            if (len(set(pair)) == 2 and all(venue in account_snapshots for venue in pair) and
+                    not any(matching_position(venue, local) for venue in pair)):
+                _settle_flat_position(local, observed_at)
+                closed_symbols.append(str(local.get('symbol', '')).upper())
+        resumable_positions = [p for p in resumable_positions if p.get('status') != 'closed']
+
         # Other user positions must not prevent a local record from being
         # reconciled when the specific symbol is flat on both selected venues.
         local_has_live_position = any(
@@ -281,14 +311,18 @@ def reconcile_pair(root, venues, state_venues=None):
             from src.execution.position_recovery import validate_portfolio_accounts
             validate_portfolio_accounts(state['positions'], managed_scope, account_snapshots, matching_position)
             observed_at = utc_now()
+            reconcile_unsent_closes(root, state['positions'], observed_at)
+            validate_resume_closes(state['positions'])
             state.update(halted_reason=None, resume_verified=True, resume_verified_at=observed_at,
                 resume_proof=dict(portfolio=True, venues=managed_scope, checked_at=observed_at,
                                   fingerprint=position_fingerprint(state['positions'])),
                 last_reconciled_at=observed_at,
                 last_reconciliation='各组原平台账户、数量、方向及活动订单均已核对，允许恢复原仓位监控')
             _atomic_json(state_path, state)
-            return dict(success=True, orders_submitted=False, changed=False, resume_ready=True,
-                        symbols=symbols, pending_accounting_count=0,
+            return dict(success=True, orders_submitted=False, changed=bool(closed_symbols), resume_ready=True,
+                        symbols=symbols, reconciled_closed_symbols=closed_symbols,
+                        pending_accounting_count=sum(bool(p.get('accounting_pending') or
+                            p.get('pending_funding_venues')) for p in state['positions']),
                         message='各组持仓已按原平台核对匹配；可恢复监控，未发送订单')
         if resumable_positions and local_has_live_position:
             validate_paired_positions(state.get('positions', []), venues)
@@ -333,6 +367,8 @@ def reconcile_pair(root, venues, state_venues=None):
                             abs(abs(actual_size) - decimal(expected_size)) > decimal('0.000001')):
                         raise ValueError(venue + ' ' + str(local.get('symbol')) + '持仓方向或数量不匹配')
             observed_at = utc_now()
+            reconcile_unsent_closes(root, state['positions'], observed_at)
+            validate_resume_closes(state['positions'])
             state['halted_reason'] = None
             state['resume_verified'] = True
             state['resume_verified_at'] = observed_at
@@ -341,9 +377,11 @@ def reconcile_pair(root, venues, state_venues=None):
             state['last_reconciled_at'] = observed_at
             state['last_reconciliation'] = '只读核对确认未平仓记录与两平台账户持仓匹配；允许恢复监控，未发送订单'
             _atomic_json(state_path, state)
-            return {'success': True, 'orders_submitted': False, 'changed': False,
+            return {'success': True, 'orders_submitted': False, 'changed': bool(closed_symbols),
                     'resume_ready': True, 'symbols': symbols,
-                    'pending_accounting_count': 0,
+                    'reconciled_closed_symbols': closed_symbols,
+                    'pending_accounting_count': sum(bool(p.get('accounting_pending') or
+                        p.get('pending_funding_venues')) for p in state['positions']),
                     'message': '两平台账户持仓与本地未平仓记录已匹配；可恢复监控，未发送订单。'}
         # Funding history for main accounts requires an authenticated,
         # read-only SDK token even though the account/position snapshot above
@@ -379,7 +417,7 @@ def reconcile_pair(root, venues, state_venues=None):
 
         observed_at = utc_now()
         now_ms = _timestamp_ms(observed_at)
-        changed = False
+        changed = bool(closed_symbols)
         for position in state.get('positions', []):
             # A pre-schema closed row with zero entry quantity cannot
             # represent a filled hedge.  Do not leave it as an eternal
@@ -394,20 +432,7 @@ def reconcile_pair(root, venues, state_venues=None):
                 continue
             if position.get('status') != 'closed':
                 changed = True
-                position['reconciled_at'] = observed_at
-                position['reconciliation_note'] = '两平台账户与活动订单已只读核对为空；历史费用字段仍保留未知'
-                position['reconciled_sizes'] = {
-                    'variational_size': position.get('variational_size', 0),
-                    'lighter_size': position.get('lighter_size', 0),
-                }
-                position['variational_size'] = 0
-                position['lighter_size'] = 0
-                position['status'] = 'closed'
-                if ((position.get('entry_size_variational') or position.get('entry_size_lighter')) and
-                        (position.get('close_price_variational') is None or
-                         position.get('close_price_lighter') is None)):
-                    position['accounting_pending'] = True
-                    position['reconciliation_note'] = '两平台原仓位已确认空仓；实际平仓成交与费用仍待历史核账'
+                _settle_flat_position(position, observed_at)
             pending = list(position.get('pending_funding_venues') or [])
             if not pending:
                 continue
@@ -456,6 +481,7 @@ def reconcile_pair(root, venues, state_venues=None):
                 'accounts_flat': not any(decimal(p.get('position', 0)) != 0
                     for snapshot in account_snapshots.values() for p in snapshot.get('positions', [])),
                 'symbols': symbols, 'pending_accounting_count': pending_count,
+                'reconciled_closed_symbols': closed_symbols,
                 'message': ('两平台账户已核对空仓；资金费已自动补齐，历史账务已完成，未发送订单。'
                             if pending_count == 0 else
                             '两平台账户已核对空仓；费用或资金费仍未完整返回，继续自动核账，未发送订单。')}

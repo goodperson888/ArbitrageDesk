@@ -81,6 +81,7 @@ class ExecutionTests(unittest.TestCase):
         result = terminal_receipt(order(status='canceled-not-enough-liquidity', size='.4'),
                                   self.plan, 7, 123, trades('.4'))
         self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['platform_status'], 'canceled-not-enough-liquidity')
         self.assertEqual(result['filled_size'], .4)
         self.assertEqual(result['fees_usdc'], 0)
         self.assertIsNone(result['funding_usdc'])

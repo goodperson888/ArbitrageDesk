@@ -94,3 +94,60 @@ class HistorySyncTests(unittest.TestCase):
         self.sync.poll(self.book)
         self.finish()
         self.fetch.assert_not_called()
+
+    def test_live_closed_accounting_is_small_nonblocking_and_does_not_query_open_groups(self):
+        entered, release = threading.Event(), threading.Event()
+        def fetch(row):
+            self.assertEqual(row['id'], 'closed')
+            entered.set()
+            self.assertTrue(release.wait(2))
+            return dict(success=True, orders_submitted=False, complete=False)
+        self.active.return_value = True
+        self.sync = HistorySync(self.fetch, self.active, now=lambda: self.time,
+                                pending_fetch=fetch, read_ready=lambda: True)
+        row = dict(pending(), id='closed', status='closed', recovered_close_fills={'lighter': {}})
+        self.book['closed_positions'] = [row]
+        self.sync.poll(self.book)
+        self.assertTrue(entered.wait(1))
+        for _ in range(20):
+            self.assertEqual(self.sync.poll(self.book)['state'], 'refreshing')
+        release.set()
+        self.finish()
+        self.fetch.assert_not_called()
+        self.assertEqual(self.sync._state['state'], 'partial', 'successful HTTP without missing fees is not settled')
+        self.time += 599
+        self.sync.poll(self.book)
+        self.assertEqual(self.sync._pending_failures['closed'], 1)
+
+    def test_live_busy_and_settled_rows_do_not_start_background_reads(self):
+        self.active.return_value = True
+        read = Mock()
+        ready = Mock(return_value=False)
+        self.sync = HistorySync(self.fetch, self.active, now=lambda: self.time, pending_fetch=read, read_ready=ready)
+        self.book['closed_positions'] = [dict(pending(), id='closed', status='closed', recovered_close_fills={'lighter': {}})]
+        self.sync.poll(self.book)
+        read.assert_not_called()
+        ready.return_value = True
+        self.book['closed_positions'][0]['accounting_pending'] = False
+        self.sync.poll(self.book)
+        read.assert_not_called()
+
+    def test_live_trade_starting_after_scheduling_yields_without_request(self):
+        self.active.return_value = True
+        read = Mock()
+        ready = Mock(side_effect=[True, False])
+        self.sync = HistorySync(self.fetch, self.active, now=lambda: self.time, pending_fetch=read, read_ready=ready)
+        self.sync.poll({'closed_positions':[dict(pending(), id='closed', status='closed', recovered_close_fills={'lighter': {}})]})
+        self.finish()
+        read.assert_not_called()
+
+    def test_recent_persisted_probe_survives_scheduler_restart(self):
+        from src.common.market_data import utc_now
+        self.active.return_value = True
+        read = Mock()
+        self.sync = HistorySync(self.fetch, self.active, now=lambda: self.time,
+                                pending_fetch=read, read_ready=lambda: True)
+        row = dict(pending(), id='closed', status='closed', recovered_close_fills={'lighter': {}},
+                   accounting_check=dict(checked_at=utc_now(), retry_after_seconds=1200))
+        self.sync.poll({'closed_positions':[row]})
+        read.assert_not_called()

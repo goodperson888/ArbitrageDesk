@@ -12,6 +12,19 @@ from src.strategy.arbitrage_strategy import ArbitrageStrategy
 
 
 class CenterStatisticsTests(unittest.TestCase):
+    def test_touch_profiles_are_cached_separately_without_synchronous_history_read(self):
+        self.insert([0,10,0,-10]*10)
+        key=self.key+('touches',2.,3)
+        value=self.stats.calculate(key)
+        self.assertEqual(value['channel_statistics']['touch_statistics']['upper']['count'],10)
+        with patch.object(self.stats,'calculate',side_effect=AssertionError('hot path')), \
+                patch.object(self.history,'_connect',side_effect=AssertionError('hot path')):
+            self.stats.get(*self.key,touch_tolerance_bps=2,touch_min_count=3)
+            self.stats.get(*self.key,touch_tolerance_bps=3,touch_min_count=3)
+            self.stats.get(*self.key,touch_tolerance_bps=2,touch_min_count=3)
+        self.assertEqual(self.stats.jobs.qsize(),2)
+        self.assertNotEqual(self.stats._path(key),self.stats._path(self.key))
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)

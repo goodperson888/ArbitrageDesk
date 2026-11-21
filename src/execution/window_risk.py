@@ -35,6 +35,7 @@ class ExecutionWindowRisk:
 
     def __init__(self, saved=None):
         self.routes = {}
+        self._quality = {}
         if not isinstance(saved, dict):
             return
         for key, value in list(saved.items())[-self.MAX_ROUTES:]:
@@ -115,6 +116,10 @@ class ExecutionWindowRisk:
     def outcome(self, key, reason, notional, now=None, ceiling=None, attempt_id=None):
         now = time.time() if now is None else now
         profile = self._profile(key)
+        outcome_reason = reason if reason in REASON_LABELS or reason == 'paired' else 'unknown'
+        if key not in self._quality and len(self._quality) >= self.MAX_ROUTES:
+            self._quality.pop(next(iter(self._quality)))
+        self._quality[key] = (self._quality.get(key, ()) + ((now, outcome_reason),))[-self.MAX_SAMPLES:]
         if reason == 'paired':
             # Restore size gradually; a single small successful hedge must
             # not immediately return a fragile route to the original size.
@@ -144,6 +149,14 @@ class ExecutionWindowRisk:
         if 0 <= now - profile.get('size_cap_at', 0) <= self.MAX_AGE:
             return profile.get('size_cap_usdc')
         return None
+
+    def quality(self, key, now=None):
+        """Only rank economically tied candidates; never alter entry guards."""
+        now = time.time() if now is None else now
+        rows = [reason for at, reason in self._quality.get(key, ())
+                if 0 <= now - at <= self.FAILURE_MEMORY_SECONDS and
+                reason in ('paired', 'edge', 'price', 'timeout', 'zero_fill', 'partial_fill')]
+        return (1 + rows.count('paired')) / (2 + len(rows))
 
 
 def hedge_failures(*, timely, within_cap, within_price, observed_net_bps, minimum_bps):

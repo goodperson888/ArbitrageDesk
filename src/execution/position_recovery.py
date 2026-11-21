@@ -4,6 +4,7 @@ import json
 
 from src.common.market_data import age_seconds
 from src.execution.orders import decimal
+from src.execution.close_recovery import validate_resume_closes
 
 
 RESUME_MAX_AGE_SECONDS = 60
@@ -11,7 +12,9 @@ RESUME_FIELDS = ('id', 'symbol', 'status', 'variational_venue', 'lighter_venue',
                  'variational_side', 'lighter_side', 'variational_size', 'lighter_size',
                  'entry_size_variational', 'entry_size_lighter',
                  'entry_price_variational', 'entry_price_lighter', 'open_time',
-                 'grid_cycle_id', 'grid_layer', 'grid_anchor_bps', 'grid_entry_net_bps')
+                 'grid_cycle_id', 'grid_layer', 'grid_anchor_bps', 'grid_entry_net_bps',
+                 'close_started_time', 'close_reason', 'close_attempts',
+                 'close_order_results', 'close_receipt_order_ids')
 
 
 def position_fingerprint(positions):
@@ -20,8 +23,9 @@ def position_fingerprint(positions):
         if position.get('status') == 'closed':
             continue
         row = {key: position.get(key) for key in RESUME_FIELDS}
-        if hasattr(row['open_time'], 'isoformat'):
-            row['open_time'] = row['open_time'].isoformat()
+        for key in ('open_time', 'close_started_time'):
+            if hasattr(row[key], 'isoformat'):
+                row[key] = row[key].isoformat()
         rows.append(row)
     rows.sort(key=lambda row: str(row['id']))
     encoded = json.dumps(rows, sort_keys=True, ensure_ascii=False, allow_nan=False)
@@ -69,6 +73,7 @@ def resume_proof_valid(state, venues):
             validate_portfolio_positions(state.get('positions', []), managed)
         else:
             validate_paired_positions(state.get('positions', []), venues)
+        validate_resume_closes(state.get('positions', []))
         return proof.get('fingerprint') == position_fingerprint(state['positions'])
     except (ValueError, TypeError, ArithmeticError, AttributeError):
         return False

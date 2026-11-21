@@ -62,6 +62,13 @@ class OrderJournal:
             row = db.execute('SELECT * FROM orders WHERE seq=?', (seq,)).fetchone()
         return dict(row) if row else None
 
+    def find(self, venue, account, client_id):
+        """Read one intent by its durable identity, without reserving a send."""
+        with closing(self.connect()) as db, db:
+            row = db.execute('SELECT * FROM orders WHERE venue=? AND account=? AND client_id=?',
+                             (venue, str(account), client_id)).fetchone()
+        return dict(row) if row else None
+
     def summary(self):
         with closing(self.connect()) as db, db:
             return [dict(r) for r in db.execute('SELECT seq,venue,client_id,state FROM orders ORDER BY seq DESC LIMIT 100')]

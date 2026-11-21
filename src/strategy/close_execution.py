@@ -174,6 +174,10 @@ class CloseExecutionMixin:
             # Resolve each leg in its own transport worker: a slow peer quote
             # must not hold the other verified residual leg before sending.
             quote = CloseRetryReads.resolve_quote(retry_quotes.get(name), position.symbol, size)
+            close_from_quote = getattr(trader, 'close_position_from_quote', None)
+            if quote is not None and callable(close_from_quote):
+                return close_from_quote(position.symbol, side, size, client_order_id=client_id,
+                    quote=quote, reduce_only=True, slippage_bps=self.slippage_tolerance)
             if quote is not None and callable(getattr(trader, 'place_order', None)):
                 close_side = 'sell' if direction(side) == 'buy' else 'buy'
                 return trader.place_order(position.symbol, close_side, size,
@@ -193,17 +197,21 @@ class CloseExecutionMixin:
                     receipt, error = None, exc
                 yield job, receipt, error
                 # The coordinator has applied and persisted this receipt by
-                # the time the generator resumes. Read only the confirmed
-                # leg's remainder while the other transport is still waiting.
-                name, trader, side, size, client_id, attempt = job
-                remaining = getattr(position, name + '_size')
-                previous = position.close_order_results.get(name, {})
-                if (retry_reads is not None and remaining > 1e-12
-                        and any(not peer.done() for peer in futures)
-                        and previous.get('confirmed') is True
-                        and previous.get('status') in ('filled', 'partial', 'canceled', 'rejected')
-                        and position.close_attempts.get(name, 0) < 1 + self.single_leg_recovery_max_attempts):
-                    retry_reads.start(position, (name, trader, side, remaining))
+                # the time the generator resumes. Start required remainder
+                # reads before the coordinator's retry-validation stage.
+                if retry_reads is not None:
+                    has_fills = self._exit_has_fills(position)
+                    waiting = any(not peer.done() for peer in futures)
+                    for name, trader, side, _, _, _ in jobs:
+                        remaining = getattr(position, name + '_size')
+                        previous = position.close_order_results.get(name, {})
+                        if (remaining > 1e-12 and (waiting or has_fills)
+                                and previous.get('confirmed') is True
+                                and previous.get('status') in ('filled', 'partial', 'canceled', 'rejected')
+                                and position.close_attempts.get(name, 0) < 1 + self.single_leg_recovery_max_attempts):
+                            # Quotes are only prefetched after an actual fill
+                            # commits this group to residual recovery.
+                            retry_reads.start(position, (name, trader, side, remaining), quote=has_fills)
 
     @for_position
     def _apply_close_receipt(self, position, name, side, requested, receipt):
@@ -212,12 +220,15 @@ class CloseExecutionMixin:
         previous_ids = position.close_receipt_order_ids.setdefault(name, [])
         if order_id and order_id in previous_ids:
             raise ValueError('重复平仓回执，禁止重复扣减持仓')
+        trader = self.variational_trader if name == 'variational' else self.lighter_trader
+        self.close_liquidity.record(self._venue_name(trader, name), position.symbol,
+                                    'sell' if direction(side) == 'buy' else 'buy', receipt, requested)
         self._record_receipt('close_receipt', position, self._venue_name(
             self.variational_trader if name == 'variational' else self.lighter_trader, name), receipt)
         if order_id and filled:
             previous_ids.append(order_id)
         position.close_order_results[name].update({key: receipt.get(key) for key in (
-            'confirmed', 'status', 'filled_size', 'average_price', 'order_id', 'submitted')})
+            'confirmed', 'status', 'filled_size', 'average_price', 'order_id', 'submitted', 'platform_status')})
         setattr(position, name + '_size', max(0, requested - filled))
         if filled:
             already_closed = max(0, float(getattr(position, 'entry_size_' + name) or requested) - requested)

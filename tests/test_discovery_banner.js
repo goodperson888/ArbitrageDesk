@@ -42,6 +42,11 @@ context.renderForTest({running:false,state:'finished',tracked_position_count:1,
     timestamp:new Date(Date.now()-3600000).toISOString(),detail:{}}});
 assert.match(node('execution-live-title').textContent,/已有成交持仓.*监控已停止/);
 assert.match(node('execution-live-detail').title,/CASHCAT/);
+context.renderForTest({running:true,recovery_blocked:true,tracked_position_count:2,
+    position_monitor:{read_only:true,stop_reason:'平仓回执需核对：TimeoutError',heartbeat_stale:false}});
+assert.match(node('execution-live-title').textContent,/自动下单已暂停.*持仓只读监控中/);
+assert.match(node('execution-live-detail').title,/自动开平仓已锁定/);
+assert.doesNotMatch(node('execution-live-detail').title,/自动继续扫描/);
 const oldFailure={event:'stage_failed',timestamp:new Date(Date.now()-50000).toISOString(),
     detail:{stage:'Arcus 参考价格',reason:'接口限流 HTTP 429；暂停 REST 请求 121 秒'}};
 context.renderForTest({running:true,mode:'continuous_monitor',venues:['lighter','arcus'],latest_event:oldFailure,
@@ -70,4 +75,43 @@ assert.match(node('execution-live-detail').title,/已达同时持仓数上限/);
 context.renderForTest({running:true,mode:'continuous_monitor',venues:['lighter','arcus'],single_position_cycle:false,
     entry_scan:{capacity_block_reason:'尚未达到交易间隔'}});
 assert.match(node('execution-live-title').textContent,/尚未达到交易间隔/);
+context.renderForTest({running:true,mode:'continuous_monitor',venues:['lighter','arcus'],
+    latest_event:oldFailure,last_rejection:oldFailure,
+    position_monitor:{entry_paused:true,heartbeat_stale:false,updated_at:new Date().toISOString(),
+        entry_pause_reason:'GME 账户核验受阻，暂停新开仓；后台重试中',
+        entry_scan:{cached_scan:{updated_at:'2026-11-16T11:54:36Z'}},
+        positions:[{symbol:'GME',account_status:'pending',account_errors:['PoolTimeout']}]}});
+assert.match(node('execution-live-title').textContent,/新开仓暂停.*持仓核验受阻/);
+assert.match(node('execution-live-detail').title,/GME.*后台重试.*自动继续扫描.*PoolTimeout/);
+assert.doesNotMatch(node('execution-live-detail').title,/121 秒|尚未下单/);
+assert.match(node('execution-live-time').textContent,/监控更新.*最近扫描/);
+context.renderForTest({running:true,mode:'continuous_monitor',venues:['lighter','arcus'],
+    position_monitor:{entry_paused:true,heartbeat_stale:false,
+        positions:[{symbol:'GME',account_status:'pending',legs:{second:{venue:'arcus',account:{
+            status:'pending',error:'等待可用连接超时（PoolTimeout）',blocked_for_seconds:31,
+            last_success_at:new Date().toISOString(),reading:false,retry_in_seconds:1.4}}}},
+            {symbol:'WLFI',account_status:'pending'}]}});
+assert.match(node('execution-live-detail').title,/受影响持仓：GME、WLFI/);
+assert.match(node('execution-live-detail').title,/Arcus.*PoolTimeout.*已持续 31 秒.*账户最近成功.*2 秒后重试/);
+context.renderForTest({running:true,mode:'continuous_monitor',venues:['lighter','arcus'],
+    position_monitor:{entry_paused:true,heartbeat_stale:false,
+        entry_pause_reason:'GME 持仓监控待核验，暂停新开仓；后台重试中',
+        positions:[{symbol:'GME',account_status:'ready',error:'持仓报价过期，平仓条件暂无法判断',
+            legs:{lighter:{venue:'arcus',error:'行情时间超前，等待同步报价'}}}]}});
+assert.match(node('execution-live-title').textContent,/新开仓暂停.*持仓行情受阻/);
+assert.match(node('execution-live-detail').title,/GME.*Arcus.*行情时间超前.*自动继续扫描.*无需调整本机时间/);
+assert.doesNotMatch(node('execution-live-detail').title,/账户核验受阻|PoolTimeout/);
+context.renderForTest({running:true,mode:'continuous_monitor',venues:['lighter','arcus'],
+    position_monitor:{entry_paused:true,heartbeat_stale:false,
+        positions:[{symbol:'GME',account_status:'ready',error:'持仓行情待更新',
+            legs:{lighter:{venue:'arcus',error:'行情后台校时中，等待可靠时间源'}}}]}});
+assert.match(node('execution-live-title').textContent,/后台校时中/);
+assert.doesNotMatch(node('execution-live-detail').title,/请检查本机|自动同步/);
+context.renderForTest({running:true,mode:'continuous_monitor',venues:['lighter','arcus'],
+    position_monitor:{entry_paused:true,heartbeat_stale:false,
+        positions:[{symbol:'GME',account_status:'ready',error:'持仓行情待更新',
+            legs:{lighter:{venue:'arcus',error:'行情时间超前，等待同步报价',
+                connection:{quote_clock:{ready:true}}}}}]}});
+assert.match(node('execution-live-detail').title,/内部校时已就绪，等待平台新报价/);
+assert.doesNotMatch(node('execution-live-detail').title,/请检查本机|后台正在校时/);
 console.log('Discovery cooldown, local REST pacing and exchange 429 banners: PASS');

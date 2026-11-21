@@ -41,7 +41,7 @@ if __name__ == '__main__':
     parser.add_argument('--reversion-target-mode', choices=('center', 'zero', 'either'), default='center',
                         help='历史回归目标：历史中心、0 或任一目标')
     parser.add_argument('--reversion-window-seconds', type=int, default=604800,
-                        help='历史回归统计窗口，单位秒，范围 300 至 604800')
+                        help='历史回归统计窗口，单位秒，范围 300 至 7776000（90天）')
     parser.add_argument('--reversion-min-count', type=int, default=0,
                         help='窗口内最少回归次数，0 表示不限')
     parser.add_argument('--reversion-min-deviation-bps', type=float, default=0,
@@ -76,6 +76,8 @@ if __name__ == '__main__':
     if not args.run:
         print(json.dumps({**implementation_status(), 'runtime_blockers':runtime_blockers(profile)},ensure_ascii=False,indent=2))
     else:
+        from src.common.quote_clock import quote_clock
+        quote_clock.start()
         # The runtime rechecks saved positions against the actual accounts
         # under its execution lease before consuming a recovery proof. Let
         # that check handle an existing hedge instead of rejecting it here.

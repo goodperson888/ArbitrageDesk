@@ -18,7 +18,7 @@ from pathlib import Path
 
 _services = {}
 _services_lock = threading.Lock()
-VERSION = 4  # Execution coordinates; old ratio-denominator snapshots expire.
+VERSION = 6  # Equal-duration long-window statistics and explicit aggregation.
 
 
 def center_stats_for(history, symbol, route, seconds=604800, entry_quantile=90):
@@ -66,10 +66,16 @@ class CenterStatistics:
         digest = hashlib.sha256(json.dumps((VERSION, key)).encode()).hexdigest()[:32]
         return self.directory / (digest + '.json')
 
-    def get(self, symbol, route, seconds=604800, quantile=90):
+    def get(self, symbol, route, seconds=604800, quantile=90, *,
+            touch_tolerance_bps=None, touch_min_count=None):
         key = (symbol, route, int(seconds), float(quantile))
         if key[2] <= 0 or not math.isfinite(key[3]) or not 50 <= key[3] <= 99.9:
             raise ValueError('历史中心窗口或入场分位参数无效')
+        if touch_tolerance_bps is not None:
+            from src.execution.channel_policy import channel_policy
+            policy = channel_policy({'channel_policy': dict(method='touches',
+                touch_tolerance_bps=touch_tolerance_bps,touch_min_count=touch_min_count)})
+            key += ('touches',policy['touch_tolerance_bps'],policy['touch_min_count'])
         return self._get(key)
 
     def get_reversion(self, symbol, route, seconds=604800, band_bps=2.0,
@@ -80,6 +86,18 @@ class CenterStatistics:
                 or not 50 <= key[3] <= 99.9 or key[5] <= 0 or key[7] < 0
                 or target_mode not in ('center','zero','either')):
             raise ValueError('历史回归统计参数无效')
+        return self._get(key)
+
+    def get_quality(self, symbol, route, seconds=604800, target_mode='center',
+                    min_deviation_bps=0., policy=None):
+        if (not 300 <= seconds <= 7776000 or target_mode not in ('center','zero','either')
+                or not math.isfinite(min_deviation_bps) or not 0 <= min_deviation_bps <= 100000):
+            raise ValueError('回归质量统计参数无效')
+        if policy is not None:
+            from src.execution.channel_policy import channel_policy
+            policy = channel_policy({'channel_policy': policy})
+        key = (symbol, route, int(seconds), 90., 'quality', target_mode,
+               float(min_deviation_bps), json.dumps(policy, sort_keys=True) if policy else '')
         return self._get(key)
 
     def _get(self, key):
@@ -123,18 +141,29 @@ class CenterStatistics:
         result['statistics_age_seconds'] = max(0, age)
         result['statistics_ready'] = 0 <= age <= 120
         result['statistics_status'] = 'ready' if result['statistics_ready'] else 'stale'
-        if len(key) > 4:
+        if len(key) > 4 and key[4] == 'reversion':
             stamp = result.get('last_reversion_at')
             result['last_reversion_age_seconds'] = max(0,now-stamp) if stamp is not None else None
         latest = result.get('last_sample_at')
         if (not 0 <= age <= 120 or not isinstance(latest, (int, float))
                 or not math.isfinite(latest) or not 0 <= now - latest <= 120):
             result.update(center_ready=False, center_status='stale', center_reason='历史中心最近有效样本已过期，等待更新')
+            if len(key) > 4 and key[4] == 'quality':
+                result.update(quality_ready=False, quality_reason='最近有效报价或统计快照已过期，等待后台更新')
         return result
 
     def calculate(self, key):
         symbol, route, seconds, quantile = key[:4]
-        if len(key) > 4:
+        if len(key) > 4 and key[4] == 'quality':
+            from .reversion_quality import quality_snapshot
+            policy = json.loads(key[7]) if key[7] else None
+            base_key = (symbol, route, policy['window_seconds'] if policy else seconds,
+                        policy['quantile'] if policy else quantile)
+            if policy and policy['method'] == 'touches':
+                base_key += ('touches', policy['touch_tolerance_bps'], policy['touch_min_count'])
+            stats = self.calculate(base_key)
+            return quality_snapshot(self.history, symbol, route, seconds, key[5], key[6], policy, stats)
+        if len(key) > 4 and key[4] == 'reversion':
             result = dict(self.history.reversion_stats(symbol, route, seconds, key[5], key[6], key[7], quantile,
                                                       execution_basis=True))
             # The drawer reads detailed events on demand; scanning only needs
@@ -157,6 +186,24 @@ class CenterStatistics:
         center = percentile(ordered, .5)
         from src.execution.channel_policy import sample_statistics
         channel = sample_statistics(clean, quantile)
+        if len(key) > 4 and key[4] == 'touches':
+            from src.execution.channel_policy import touch_statistics
+            # Bucket averages cannot prove intrabucket reversals. Only the
+            # retained raw history supplies independent touch evidence.
+            touch_window = min(seconds, 7 * 86400)
+            touch_prepared = (self.history.prepared_samples(symbol, route, touch_window)
+                              if seconds > touch_window else prepared)
+            touch_rows = [(stamp, ratio_to_directed_bps(value))
+                          for stamp, value in touch_prepared['rows']]
+            channel = sample_statistics(touch_rows, quantile)
+            channel['touch_statistics'] = touch_statistics(touch_rows,key[5],key[6])
+            channel['touch_window_seconds'] = touch_window
+            if seconds > touch_window:
+                clean = touch_rows
+                ordered = sorted(value for _, value in clean)
+                center = percentile(ordered, .5)
+                prepared = touch_prepared
+                anomalies, threshold = prepared['anomaly_count'], prepared['anomaly_threshold_bps']
         span = clean[-1][0] - clean[0][0] if clean else 0
         latest = clean[-1][0] if clean else None
         ready = len(clean) >= 30 and span >= 870 and latest is not None and 0 <= now - latest <= 120
@@ -173,6 +220,9 @@ class CenterStatistics:
         reason = ('近期中心与统计窗口中心有偏移，供稳定性参考' if drifting else
                   '中心样本就绪' if ready else '历史中心有效样本不足30个或覆盖不足14.5分钟')
         return dict(symbol=symbol, pair_key=route, seconds=seconds, center_bps=center, spread_basis='max_price',
+            sample_interval_seconds=prepared.get('sample_interval_seconds', 30),
+            approximate=prepared.get('approximate', False),
+            aggregate_buckets=prepared.get('aggregate_buckets', 0),
             samples=len(clean), raw_samples=prepared['raw_samples'], invalid_quote_samples=prepared['invalid_quote_samples'],
             anomaly_count=anomalies, anomaly_threshold_bps=threshold,
             first_sample_at=clean[0][0] if clean else None, last_sample_at=latest,

@@ -10,6 +10,16 @@ from src.execution.funding_forecast import funding_scenario
 
 
 class TargetReturnMixin:
+    @staticmethod
+    def _projection_target(context, buy, sell):
+        channel = context.get('channel')
+        if not channel:
+            return finite(context['target_bps'], '持仓回归目标')
+        from src.execution.channel_policy import channel_target_bps
+        side = channel.get('side')
+        a, b = (buy, sell) if side == 'upper' else (sell, buy)
+        return channel_target_bps(side, channel.get('exit_axis_bps'), a, b)
+
     @property
     def channel_enabled(self):
         return self.entry_mode == 'channel'
@@ -34,12 +44,14 @@ class TargetReturnMixin:
             current = directed_spread(a['ask'],b['bid'])
             if (current < ch['upper_bps'] if upper else current > ch['lower_bps']):
                 raise ValueError('最新双平台报价已离开通道入场边界')
-            return copy.deepcopy(frozen)
+            context = copy.deepcopy(frozen)
+            buy, sell = (a, b) if upper else (b, a)
+            context['target_bps'] = self._projection_target(context, buy, sell)
+            return context
         stats = {}
         if p['method'] != 'fixed':
-            from src.api_v2.center_statistics import center_stats_for
-            stats = center_stats_for(self.market_history,self._history_symbol(symbol),
-                '->'.join(axis),p['window_seconds'],p['quantile'])
+            from src.execution.channel_policy import channel_stats_for
+            stats = channel_stats_for(self.market_history,self._history_symbol(symbol),'->'.join(axis),p)
         bounds = channel_bounds(p,stats)
         self._channel_cycle_gate(symbol, axis, upper, directed_spread(a['ask'],b['bid']), bounds, p)
         context = channel_context(p,bounds,a,b,upper_direction=upper,symbol=symbol,
@@ -143,7 +155,7 @@ class TargetReturnMixin:
                     funding = funding_scenario(buy_q, sell_q, preview_policy(self.config))
                     context.update(funding_reserve_bps=finite(funding['budget_bps'], '整轮资金费预算', 0),
                                    funding_forecast=funding)
-                projection = exit_projection(buy_q, sell_q, context['target_bps'],
+                projection = exit_projection(buy_q, sell_q, self._projection_target(context, buy_q, sell_q),
                     closing[direction][buy_leg], closing[direction][sell_leg], context['funding_reserve_bps'],
                     max(float(buy_q['ask']), float(sell_q['ask'])) * (1 + max(opening_impacts[direction].values()) / 10000))
                 models[direction] = dict(context=context, projection=projection,
@@ -189,7 +201,7 @@ class TargetReturnMixin:
                      else (second_quote, first_quote))
         buy_leg, sell_leg = (('variational', 'lighter') if direction == 'buy_variational'
                              else ('lighter', 'variational'))
-        return exit_projection(buy, sell, context['target_bps'],
+        return exit_projection(buy, sell, self._projection_target(context, buy, sell),
             selected['close_slippage_bps'][buy_leg], selected['close_slippage_bps'][sell_leg],
             context['funding_reserve_bps'], max(first_fill_price,
                 selected['target_projection']['funding_reference_price'],
@@ -232,9 +244,10 @@ class TargetReturnMixin:
         if isinstance(net, (int, float)) and math.isfinite(net):
             # Complete four-side BBO estimate outranks an uncosted midpoint
             # deviation. Final sized preparation decides executable ranking.
-            return (3 if preview.get('meets_floor') else 2, preview['profit_usdc'],
+            return (3 if preview.get('meets_floor') else 2, round(preview['profit_usdc'], 4),
+                    self.execution_quality_rank(opportunity), preview['profit_usdc'],
                     -float(preview.get('quote_age_seconds', math.inf)), net, recency, context.get('samples', 0), context['route'])
-        return (1, deviation * self.entry_notional_cap() / 10000, -math.inf, deviation,
+        return (1, deviation * self.entry_notional_cap() / 10000, .5, 0.0, -math.inf, deviation,
                 recency, context.get('samples', 0), context['route'])
 
     def discovery_return_preview(self, symbol, direction, context, quotes):

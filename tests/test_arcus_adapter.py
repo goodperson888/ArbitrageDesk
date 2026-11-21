@@ -1,5 +1,7 @@
+import asyncio
+from datetime import datetime, timedelta, timezone
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 from cryptography.hazmat.primitives.asymmetric import ed25519
@@ -9,6 +11,96 @@ from src.web import local_credentials
 
 
 class ArcusAdapterTest(unittest.IsolatedAsyncioTestCase):
+    async def test_expired_catalog_refresh_does_not_delay_live_quote(self):
+        adapter = ArcusAdapter(proxy_url=None)
+        adapter._ensure_ws = lambda: None
+        payload = {'markets': [{'marketId': 1, 'marketDisplayName': 'BTC-USD', 'oraclePrice': '100'}]}
+        adapter._get = AsyncMock(return_value=payload)
+        await adapter.list_instruments()
+        adapter._catalog_cache = (datetime.now(timezone.utc)-timedelta(seconds=61), adapter._catalog_cache[1])
+        now = datetime.now(timezone.utc)
+        adapter._bbo['BTC-PERP'] = dict(bid=99, ask=101, observed=now, source='arcus_websocket')
+        started, release = asyncio.Event(), asyncio.Event()
+        async def blocked_refresh(path):
+            self.assertEqual(path, '/v1/markets')
+            started.set()
+            await release.wait()
+            return payload
+        adapter._get = AsyncMock(side_effect=blocked_refresh)
+        try:
+            quote = await asyncio.wait_for(adapter.get_quote('BTC'), .5)
+            await started.wait()
+            self.assertEqual(quote.bid, 99)
+            self.assertFalse(quote.stale)
+            await asyncio.gather(*(adapter.list_instruments() for _ in range(10)))
+            self.assertEqual(adapter._get.await_count, 1)
+            release.set()
+            await adapter._catalog_task
+        finally:
+            await adapter.close()
+
+    async def test_cold_catalog_is_shared_and_survives_one_cancelled_caller(self):
+        adapter = ArcusAdapter(proxy_url=None)
+        adapter._ensure_ws = lambda: None
+        started, release = asyncio.Event(), asyncio.Event()
+        async def get(path):
+            started.set()
+            await release.wait()
+            return {'markets': [{'marketId': 1, 'marketDisplayName': 'BTC-USD'}]}
+        adapter._get = AsyncMock(side_effect=get)
+        callers = [asyncio.create_task(adapter.list_instruments()) for _ in range(8)]
+        try:
+            await started.wait()
+            callers[0].cancel()
+            await asyncio.gather(callers[0], return_exceptions=True)
+            self.assertFalse(adapter._catalog_task.cancelled())
+            release.set()
+            results = await asyncio.gather(*callers[1:])
+            self.assertTrue(all(len(rows) == 1 for rows in results))
+            self.assertEqual(adapter._get.await_count, 1)
+        finally:
+            release.set()
+            await asyncio.gather(*callers, return_exceptions=True)
+            await adapter.close()
+
+    async def test_proxy_timeout_reaches_fallback_before_outer_deadline(self):
+        adapter = ArcusAdapter(proxy_url='http://127.0.0.1:9999')
+        original = asyncio.wait_for
+        deadlines = []
+        async def short_wait(awaitable, timeout):
+            deadlines.append(timeout)
+            return await original(awaitable, timeout=.01)
+        async def blocked(*args, **kwargs):
+            await asyncio.Event().wait()
+        adapter._client.get = AsyncMock(side_effect=blocked)
+        response = httpx.Response(200, json={'markets': []}, request=httpx.Request('GET','https://api.arcus.xyz/v1/markets'))
+        adapter._direct_client = type('Client', (), {'get': AsyncMock(return_value=response), 'aclose': AsyncMock()})()
+        try:
+            with patch('src.api_v2.arcus_adapter.asyncio.wait_for', short_wait):
+                self.assertEqual(await adapter._get('/v1/markets'), {'markets': []})
+            self.assertEqual(deadlines, [2.5, 2.5])
+            self.assertLess(sum(deadlines), 6)
+            adapter._direct_client.get.assert_awaited_once()
+        finally:
+            await adapter.close()
+
+    async def test_public_and_execution_quotes_share_calibrated_clock_without_renewing_old_data(self):
+        import time
+        from datetime import datetime, timezone
+        from src.common.quote_clock import QuoteClock, TimeSample
+        from src.common.market_data import MarketDataError
+        clock = QuoteClock()
+        mono = time.monotonic(); wall = time.time()
+        self.assertTrue(clock.accept([TimeSample(source,wall+2.2,mono,.01) for source in ('a','b')]))
+        received = datetime.fromtimestamp(wall,timezone.utc)
+        with patch('src.common.market_data.quote_clock',clock):
+            fresh = ArcusAdapter._observed_timestamp((wall+2.2)*1e6, received, mono)
+            self.assertTrue(0 <= (received-fresh).total_seconds() < .1)
+            old = ArcusAdapter._observed_timestamp((wall+2.2-600)*1e6, received, mono)
+            self.assertGreaterEqual((received-old).total_seconds(), 600)
+            with self.assertRaises(MarketDataError):
+                ArcusAdapter._observed_timestamp((wall+2.2+10)*1e6, received, mono)
+
     async def test_catalog_and_bbo_quote_uses_official_top_of_book(self):
         adapter = ArcusAdapter(proxy_url=None)
 

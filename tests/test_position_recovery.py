@@ -113,6 +113,240 @@ class PositionRecoveryTests(unittest.TestCase):
         self.assertTrue(resume_proof_valid(saved, VENUES))
         self.assertEqual(saved['positions'][0]['status'], 'reconcile_required')
 
+    def add_manually_flat_group(self, *, portfolio=True):
+        import copy
+        extra = copy.deepcopy(self.state['positions'][0])
+        extra.update(id='flat-lit', symbol='LIT', variational_size=4.04, lighter_size=0,
+                     entry_size_variational=4.04, entry_size_lighter=4.04,
+                     close_price_lighter=3.0207, close_attempts=dict(variational=3, lighter=2),
+                     close_order_results=dict(
+                         variational=dict(confirmed=True, status='canceled', filled_size=0),
+                         lighter=dict(confirmed=True, status='filled', filled_size=4.04)),
+                     pending_funding_venues=['variational'])
+        self.state['positions'].append(extra)
+        self.state['halted_reason'] = '平仓重试受阻：平仓重试次数已达上限，需核对账户'
+        if portfolio:
+            self.state['runtime_scope'] = dict(version=1, managed_venues=VENUES, entry_venues=VENUES)
+        self.lighter.get_market.side_effect = lambda symbol: (
+            dict(market_id=120 if symbol == 'LIT' else 45), utc_now())
+        self.arcus.market.side_effect = lambda symbol: dict(market_id=120 if symbol == 'LIT' else 45)
+        self.write_state()
+        return extra
+
+    def test_flat_single_leg_record_settles_while_another_hedge_resumes(self):
+        self.add_manually_flat_group()
+        report = reconcile_pair(self.root, VENUES)
+        self.assertTrue(report['resume_ready'])
+        self.assertEqual(report['reconciled_closed_symbols'], ['LIT'])
+        self.assertEqual(report['pending_accounting_count'], 1)
+        saved = json.loads(self.path.read_text())
+        live, closed = saved['positions']
+        self.assertEqual(live['status'], 'reconcile_required')
+        self.assertEqual(closed['status'], 'closed')
+        self.assertEqual(closed['reconciled_sizes'], dict(variational_size=4.04, lighter_size=0))
+        self.assertTrue(closed['accounting_pending'])
+        self.assertIsNone(closed.get('close_price_variational'))
+        self.assertEqual(closed['close_attempts']['variational'], 3)
+        self.assertTrue(resume_proof_valid(saved, VENUES))
+        strategy, first, second = self.strategy()
+        self.assertTrue(strategy.resume_verified_position())
+        self.assertEqual([p.symbol for p in strategy.positions if p.status == 'open'], ['PUMP'])
+        self.assertEqual(strategy.positions[1].status, 'closed')
+        first.place_order.assert_not_called()
+        second.place_order.assert_not_called()
+
+    def test_pair_recovery_also_settles_flat_group_before_paired_validation(self):
+        self.add_manually_flat_group(portfolio=False)
+        self.assertTrue(reconcile_pair(self.root, VENUES)['resume_ready'])
+        self.assertEqual(json.loads(self.path.read_text())['positions'][1]['status'], 'closed')
+
+    def test_three_venue_recovery_settles_flat_group_and_unlocks_stop_with_live_peer(self):
+        from scripts.reconcile_pair_state import reconcile_and_reset
+        self.add_manually_flat_group()
+        scope = ['lighter', 'lighter_rh', 'arcus']
+        self.state['runtime_scope'].update(managed_venues=scope, entry_venues=scope)
+        multi_path = self.root/'data/hedge_state_lighter_lighter_rh_arcus.json'
+        multi_path.write_text(json.dumps(self.state, default=lambda d: d.isoformat()))
+        stop = self.root/'data/STOP_EXECUTION'
+        stop.touch()
+        with (self.root/'.env').open('a') as env:
+            env.write('LIGHTER_RH_ACCOUNT_INDEX=8\n')
+        rh = Mock()
+        rh.client.get.return_value = ({'accounts': [dict(account_index=8, pending_order_count=0,
+                                                        positions=[])]}, utc_now())
+        with patch('src.execution.reconcile_pair.LighterApiTrader', side_effect=lambda *a, **kw:
+                   rh if kw['account_index'] == 8 else self.lighter):
+            report = reconcile_and_reset(self.root, VENUES, state_venues=scope)
+        self.assertTrue(report['resume_ready'])
+        self.assertEqual(report['reconciled_closed_symbols'], ['LIT'])
+        self.assertFalse(stop.exists())
+        saved = json.loads(multi_path.read_text())
+        self.assertTrue(resume_proof_valid(saved, VENUES))
+        self.assertEqual(saved['positions'][1]['status'], 'closed')
+        self.assertIsNone(saved['halted_reason'])
+        self.arcus.submit.assert_not_called()
+        from src.execution import runtime
+        profile = dict(venues=scope, live_enabled=True, symbols=['PUMP'])
+        with patch.object(runtime, '__file__', str(self.root/'src/execution/runtime.py')):
+            blockers = runtime.pair_runtime_blockers(profile)
+            self.assertFalse(any('未核对成交/持仓' in reason for reason in blockers))
+            saved['resume_proof']['checked_at'] = (datetime.now(timezone.utc)-timedelta(minutes=2)).isoformat()
+            multi_path.write_text(json.dumps(saved))
+            blockers = runtime.pair_runtime_blockers(profile)
+            self.assertTrue(any('未核对成交/持仓' in reason for reason in blockers),
+                            'an expired portfolio proof still blocks the dashboard')
+
+    def test_live_single_leg_is_never_inferred_flat(self):
+        self.add_manually_flat_group()
+        self.account['positions'].append(dict(market_id=120, position='4.04', sign=-1, open_order_count=0))
+        before = self.path.read_bytes()
+        with self.assertRaises(ValueError):
+            reconcile_pair(self.root, VENUES)
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_other_group_mismatch_prevents_partial_state_commit(self):
+        self.add_manually_flat_group()
+        self.account['positions'][0]['position'] = '3000'
+        before = self.path.read_bytes()
+        with self.assertRaisesRegex(ValueError, '数量不匹配'):
+            reconcile_pair(self.root, VENUES)
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_failed_recovery_check_preserves_sanitized_child_reason(self):
+        console = ExecutionConsole(self.root, Mock())
+        message = '只读核对未通过：原持仓双腿数量不匹配，保留待核对；未发送订单'
+        report = dict(success=False, orders_submitted=False, message=message)
+        with patch('src.execution.console.subprocess.run', return_value=Mock(
+                returncode=0, stdout=json.dumps(report))):
+            result = console._check_pair_recovery(VENUES, dict(running=False, venues=VENUES))
+        self.assertFalse(result['success'])
+        self.assertEqual(result['message'], message)
+
+    def legacy_unsent_close(self):
+        from src.execution.journal import OrderJournal
+        OrderJournal(self.root/'data/execution_orders.sqlite')
+        row = self.state['positions'][0]
+        row.update(close_started_time=datetime.now().isoformat(), close_reason='价差收敛',
+                   entry_price_variational=102, entry_price_lighter=100,
+                   close_attempts=dict(variational=1, lighter=1),
+                   close_order_results=dict(
+                       variational=dict(confirmed=True, status='rejected', filled_size=0,
+                                        client_order_id='peer-rejected', requested_size=3065),
+                       lighter=dict(confirmed=False, status='unknown', client_order_id='old-arcus-close',
+                                    requested_size=3065, error_class='SubmissionWindowExpired')))
+        self.write_state()
+        return row
+
+    def test_legacy_unsent_close_resumes_and_next_profit_exit_does_not_halt(self):
+        from test_parallel_close import Trader
+        self.legacy_unsent_close()
+        self.assertTrue(reconcile_pair(self.root, VENUES)['resume_ready'])
+        saved = json.loads(self.path.read_text())
+        result = saved['positions'][0]['close_order_results']['lighter']
+        self.assertTrue(result['confirmed'])
+        self.assertIs(result['submitted'], False)
+        self.assertEqual(result['recovery_evidence'], 'submission_deadline_before_journal')
+        self.assertEqual(saved['positions'][0]['close_attempts'], {})
+        self.assertIsNone(saved['positions'][0]['close_started_time'])
+        self.assertEqual(result['unsent_attempts'], 1)
+        first, second = Trader('lighter', 'short', 3065), Trader('arcus', 'long', 3065)
+        strategy = ArbitrageStrategy(dict(mode='live', state_path=str(self.path)), first, second)
+        from src.api_v2.center_statistics import close_service
+        self.addCleanup(close_service, strategy.market_history)
+        self.addCleanup(strategy.close_diagnostics.writer.flush, 1)
+        self.assertTrue(strategy.resume_verified_position())
+        position = strategy.positions[0]
+        self.assertTrue(strategy.close_position(position, '价差收敛'))
+        self.assertIsNone(strategy.halted_reason)
+        self.assertEqual(position.status, 'closed')
+        self.assertEqual((len(first.calls), len(second.calls)), (1, 1))
+        self.assertNotEqual(second.calls[0]['client_order_id'], 'old-arcus-close')
+
+    def test_unsent_legacy_attempt_does_not_consume_real_residual_retry_budget(self):
+        from test_parallel_close import Trader, fill
+        self.legacy_unsent_close()
+        reconcile_pair(self.root, VENUES)
+        first, second = Trader('lighter', 'short', 3065), Trader('arcus', 'long', 3065)
+        first.responses = [dict(confirmed=True, status='canceled', filled_size=0, order_id='c'+str(i))
+                           for i in range(2)] + [fill(3065, order_id='final')]
+        strategy = ArbitrageStrategy(dict(mode='live', state_path=str(self.path),
+            risk=dict(single_leg_recovery_max_attempts=2)), first, second)
+        from src.api_v2.center_statistics import close_service
+        self.addCleanup(close_service, strategy.market_history)
+        self.addCleanup(strategy.close_diagnostics.writer.flush, 1)
+        self.assertTrue(strategy.resume_verified_position())
+        self.assertTrue(strategy.close_position(strategy.positions[0], '价差收敛'))
+        self.assertEqual(len(first.calls), 3, 'three actual sends, without the old unsent intent')
+        self.assertEqual(len(second.calls), 1, 'the filled peer is never sent again')
+        self.assertIsNone(strategy.halted_reason)
+
+    def test_submitted_zero_fill_cycle_keeps_its_durable_retry_count(self):
+        from src.execution.journal import OrderJournal
+        row = self.legacy_unsent_close()
+        row['close_order_results']['variational'].update(status='canceled', order_id='real-order')
+        self.write_state()
+        journal = OrderJournal(self.root/'data/execution_orders.sqlite')
+        entry, _ = journal.reserve('lighter', '7', 'peer-rejected', dict(reduce_only=True))
+        journal.finish(entry['seq'], dict(confirmed=True, status='canceled', filled_size=0))
+        self.assertTrue(reconcile_pair(self.root, VENUES)['resume_ready'])
+        saved = json.loads(self.path.read_text())['positions'][0]
+        self.assertEqual(saved['close_attempts'], dict(variational=1, lighter=1))
+        self.assertEqual(saved['close_started_time'], row['close_started_time'])
+
+    def test_existing_intent_keeps_deadline_failure_unknown(self):
+        from src.execution.journal import OrderJournal
+        self.legacy_unsent_close()
+        journal = OrderJournal(self.root/'data/execution_orders.sqlite')
+        journal.reserve('arcus', 'test', 'old-arcus-close', dict(reduce_only=True))
+        with self.assertRaisesRegex(ValueError, '平仓终态未确认'):
+            reconcile_pair(self.root, VENUES)
+        self.assertFalse(json.loads(self.path.read_text()).get('resume_verified'))
+
+    def test_missing_journal_or_other_error_cannot_prove_unsent(self):
+        row = self.legacy_unsent_close()
+        (self.root/'data/execution_orders.sqlite').unlink()
+        with self.assertRaisesRegex(ValueError, '平仓终态未确认'):
+            reconcile_pair(self.root, VENUES)
+        from src.execution.journal import OrderJournal
+        OrderJournal(self.root/'data/execution_orders.sqlite')
+        row['close_order_results']['lighter']['error_class'] = 'TimeoutError'
+        self.write_state()
+        with self.assertRaisesRegex(ValueError, '平仓终态未确认'):
+            reconcile_pair(self.root, VENUES)
+
+    def test_account_mismatch_does_not_repair_legacy_unknown(self):
+        self.legacy_unsent_close()
+        self.arcus_positions[0]['size'] = '3000'
+        with self.assertRaisesRegex(ValueError, '数量不匹配'):
+            reconcile_pair(self.root, VENUES)
+        result = json.loads(self.path.read_text())['positions'][0]['close_order_results']['lighter']
+        self.assertFalse(result['confirmed'])
+
+    def test_filled_evidence_cannot_be_reclassified_as_unsent(self):
+        row = self.legacy_unsent_close()
+        row['close_order_results']['lighter']['filled_size'] = 1
+        self.write_state()
+        with self.assertRaisesRegex(ValueError, '平仓终态未确认'):
+            reconcile_pair(self.root, VENUES)
+        self.assertEqual(json.loads(self.path.read_text())['positions'][0]
+                         ['close_order_results']['lighter']['filled_size'], 1)
+
+    def test_close_progress_change_invalidates_resume_proof(self):
+        self.legacy_unsent_close()
+        reconcile_pair(self.root, VENUES)
+        saved = json.loads(self.path.read_text())
+        self.assertTrue(resume_proof_valid(saved, VENUES))
+        saved['positions'][0]['close_attempts']['lighter'] = 2
+        self.assertFalse(resume_proof_valid(saved, VENUES))
+
+    def test_even_rehashed_proof_cannot_authorize_unknown_close(self):
+        self.legacy_unsent_close()
+        reconcile_pair(self.root, VENUES)
+        saved = json.loads(self.path.read_text())
+        saved['positions'][0]['close_order_results']['lighter'].update(confirmed=False, status='unknown')
+        saved['resume_proof']['fingerprint'] = position_fingerprint(saved['positions'])
+        self.assertFalse(resume_proof_valid(saved, VENUES))
+
     def test_multivenue_wrong_hedge_pair_is_rejected_before_account_reads(self):
         scope = ['lighter', 'lighter_rh', 'arcus']
         multi_path = self.root/'data/hedge_state_lighter_lighter_rh_arcus.json'
@@ -161,6 +395,49 @@ class PositionRecoveryTests(unittest.TestCase):
         self.assertIsNotNone(json.loads(path.read_text())['last_reconciled_at'])
         rh.client.get.assert_called_once()
         self.arcus.submit.assert_not_called()
+
+    def test_readonly_check_waits_for_background_recovery_and_reuses_proof(self):
+        import threading
+        console = ExecutionConsole(self.root, Mock())
+        locked, release, completed = threading.Event(), threading.Event(), threading.Event()
+        result = {}
+
+        def background():
+            with console.lock:
+                locked.set()
+                if release.wait(2):
+                    reconcile_pair(self.root, VENUES)
+
+        def check():
+            result.update(console._check_pair_recovery(VENUES, {'venues': VENUES}))
+            completed.set()
+
+        watcher = threading.Thread(target=background)
+        checker = threading.Thread(target=check)
+        with patch('src.execution.console.subprocess.run') as child:
+            watcher.start()
+            self.assertTrue(locked.wait(2))
+            checker.start()
+            try:
+                self.assertFalse(completed.wait(.05), 'must not race the background runtime lease')
+            finally:
+                release.set()
+                watcher.join(2)
+                checker.join(2)
+            self.assertTrue(completed.is_set())
+            self.assertTrue(result['success'])
+            child.assert_not_called()
+            # Actual launch paths already hold the console lock.
+            with console.lock:
+                self.assertTrue(console._check_pair_recovery(VENUES, {'venues': VENUES})['success'])
+    def test_queued_background_recovery_reuses_manual_proof(self):
+        reconcile_pair(self.root, VENUES)
+        console = ExecutionConsole(self.root, Mock())
+        console.state_path.write_text(json.dumps(dict(state='finished', started_at='original')))
+        with patch('src.execution.reconcile_pair.reconcile_pair') as reread:
+            console._auto_reconcile_loop(VENUES, 'original')
+        reread.assert_not_called()
+        self.assertEqual(json.loads(console.state_path.read_text())['reconciliation_state'], 'resume_ready')
 
     def test_empty_multivenue_scope_preserves_stop_if_third_account_is_not_flat(self):
         from scripts.reconcile_pair_state import reconcile_and_reset

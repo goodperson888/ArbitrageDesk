@@ -34,4 +34,4 @@
 
 ## 构建 Windows 包
 
-推送 `main`、`v*` 标签，或手动启动 Actions。Windows 构建机下载官方嵌入式 Python、安装依赖并执行离线检查，通过后上传便携 ZIP。构建不需要交易密钥。
+在 GitHub 的 Actions 中选择 `Windows portable package`，点击 `Run workflow` 手动打包。推送代码或标签不会自动打包。Windows 构建机下载官方嵌入式 Python、安装依赖并执行离线检查，通过后上传便携 ZIP。构建不需要交易密钥。

@@ -21,8 +21,10 @@ from src.common.sizing import allocate, smaller_book_quantities, paired_depth_ca
 from src.execution.telemetry import stage, safe_reason
 from src.execution.history import TradeHistory
 from src.execution.close_diagnostics import CloseDiagnostics, quote_snapshot
+from src.execution.opportunity_observer import OpportunityObserver
 from src.execution.hedge_policy import HedgePolicy, completion_limit, completion_edge, unwind_estimate
 from src.execution.window_risk import ExecutionWindowRisk, REASON_LABELS, hedge_failures
+from src.execution.exit_limits import CloseLiquidity
 from src.common.market_data import age_seconds, utc_now
 from src.api_v2.history import MultiVenueHistory
 from src.strategy.spread_grid import SpreadGridMixin
@@ -139,6 +141,7 @@ class ArbitrageStrategy(EntryLimitsMixin, PositionRoutesMixin, TargetReturnMixin
         self.history = TradeHistory(self.state_path.resolve().parent / 'hedge_events.sqlite')
         self.close_diagnostics = CloseDiagnostics(self.state_path.resolve().parent / 'close_diagnostics.sqlite')
         self._close_signals = {}
+        self.close_liquidity = CloseLiquidity()
         from src.execution.precheck import EntryPrecheckMixin
         self.parallel_discovery = all(isinstance(trader, EntryPrecheckMixin)
                                       for trader in (variational_trader, lighter_trader))
@@ -200,6 +203,8 @@ class ArbitrageStrategy(EntryLimitsMixin, PositionRoutesMixin, TargetReturnMixin
         self._load_position_policy()
         self.route_rollback_guards = {}
         self.execution_window_risk = ExecutionWindowRisk()
+        self.opportunity_observer = OpportunityObserver(
+            self.state_path.resolve().parent / 'entry_observations.sqlite', self.close_diagnostics.writer)
         self._single_leg_recovery_attempts = {}
         self._load()
 
@@ -461,6 +466,19 @@ class ArbitrageStrategy(EntryLimitsMixin, PositionRoutesMixin, TargetReturnMixin
     def _route_guard_key(self, symbol, direction):
         return symbol.upper() + '|' + self._route_key_for_direction(direction)
 
+    def execution_quality_rank(self, opportunity):
+        # Resolve immutable route identities; background planning must not
+        # switch the live coordinator's active adapters just for ranking.
+        index = getattr(opportunity, 'route_index', None)
+        pair = (self._route_trader_pairs[index] if index is not None and self._route_trader_pairs
+                else (self.variational_trader, self.lighter_trader))
+        venues = [self._venue_name(trader, name) for trader, name in
+                  zip(pair, ('variational', 'lighter'))]
+        if opportunity.spread_direction == 'variational_higher':
+            venues.reverse()
+        key = opportunity.symbol.upper() + '|' + '->'.join(venues)
+        return self.execution_window_risk.quality(key)
+
     def _route_pause_reason(self, symbol, direction):
         item = self.route_rollback_guards.get(self._route_guard_key(symbol, direction), {})
         until = float(item.get('paused_until') or 0)
@@ -485,6 +503,9 @@ class ArbitrageStrategy(EntryLimitsMixin, PositionRoutesMixin, TargetReturnMixin
                                           'reason_code': position.rollback_category or 'unknown'}
         self.execution_window_risk.outcome(key, position.rollback_category,
             position.entry_size_variational * position.entry_price_variational, attempt_id=position.id)
+        self.opportunity_observer.outcome(position.id, 'rollback', reason_code=position.rollback_category,
+            first_fill_price=position.entry_price_variational, first_fill_quantity=position.entry_size_variational,
+            second_fill_quantity=position.entry_size_lighter)
         position.entry_rollback_recorded = True
         self._save()
         self.history.append('route_rollback_paused' if until else 'route_rollback_recorded',
@@ -619,7 +640,7 @@ class ArbitrageStrategy(EntryLimitsMixin, PositionRoutesMixin, TargetReturnMixin
         from src.api_v2.center_statistics import reversion_stats_for
         return reversion_stats_for(self.market_history,
             self._history_symbol(symbol), self._route_key_for_direction(route_direction),
-            max(300, min(604800, int(self.reversion_window_seconds))), 2.0,
+            max(300, min(7776000, int(self.reversion_window_seconds))), 2.0,
             self.reversion_target_mode, self.reversion_min_deviation_bps)
 
     def reversion_recency_rank(self, symbol, route_direction):
@@ -875,13 +896,26 @@ class ArbitrageStrategy(EntryLimitsMixin, PositionRoutesMixin, TargetReturnMixin
                 (second_label + ' 深度报价', self.lighter_trader))
         if sizing_books is not None:
             return [fetch(name, trader, book) for (name, trader), book in zip(jobs, sizing_books)]
+        cached = {}
+        for index, (name, trader) in enumerate(jobs):
+            reader = getattr(type(trader), 'cached_sizing_book', None)
+            if callable(reader):
+                try:
+                    book = reader(trader, symbol, quantity)
+                    age = age_seconds(book.get('fetched_at')) if isinstance(book, dict) else None
+                    if age is not None and 0 <= age <= .75:
+                        cached[index] = fetch(name, trader, book)
+                except (ValueError, TypeError, KeyError, ArithmeticError):
+                    pass
+        if len(cached) == 2:
+            return [cached[0], cached[1]]
         # Both legs are read-only and independent at this point. Fetch them in
         # parallel so the second-leg quote has less time to move before the
         # first order is submitted. Each leg is still revalidated later.
         with ThreadPoolExecutor(max_workers=2) as pool:
-            futures = [pool.submit(copy_context().run, fetch, name, trader)
-                       for name, trader in jobs]
-            return [entry_result(future) for future in futures]
+            futures = {i: pool.submit(copy_context().run, fetch, name, trader)
+                       for i, (name, trader) in enumerate(jobs) if i not in cached}
+            return [cached[i] if i in cached else entry_result(futures[i]) for i in range(2)]
 
     @staticmethod
     def _book_slippage_bps(book, side, quantity):
@@ -1186,7 +1220,9 @@ class ArbitrageStrategy(EntryLimitsMixin, PositionRoutesMixin, TargetReturnMixin
                                 'second_decision_ms', 'second_submit_ms',
                                 'first_receipt_to_second_send_ms') if timing.get(key) is not None},
                             **{k: receipt.get(k) for k in ('order_id', 'status', 'filled_size', 'average_price', 'fees_usdc', 'funding_usdc', 'fee_basis', 'fee_policy_url',
-                                'raw_status', 'time_in_force', 'limit_price', 'platform_reason_code', 'platform_reason', 'platform_reason_reported')})
+                                'raw_status', 'time_in_force', 'limit_price', 'platform_reason_code', 'platform_reason', 'platform_reason_reported',
+                                'receipt_source', 'receipt_path', 'receipt_lookup_ms',
+                                'receipt_ws_ready', 'receipt_rest_started', 'receipt_ws_grace_ms')})
 
     @staticmethod
     def _directional_spread_bps(position, price_variational, price_lighter):
@@ -1384,6 +1420,8 @@ class ArbitrageStrategy(EntryLimitsMixin, PositionRoutesMixin, TargetReturnMixin
                 minimum = (self._target_floor_bps(quantity, max(buy, sell), models[direction]['projection'], reserve=True)
                            if direction in models else self.execution_min_bps(symbol))
                 evaluated_edges[direction] = (protected, minimum)
+                self.opportunity_observer.observe(self._route_guard_key(symbol, direction),
+                    quantity, v, l, protected, minimum, gross)
                 evidence = self.execution_window_risk.evidence(self._route_guard_key(symbol, direction))
                 self.history.append('quote_evaluation',symbol=symbol,direction=direction,quantity=quantity,
                     discovery_gross_bps=opportunity.spread_bps,
@@ -1597,7 +1635,7 @@ class ArbitrageStrategy(EntryLimitsMixin, PositionRoutesMixin, TargetReturnMixin
         """Changes in exposure, sizing or policy invalidate all prepared plans."""
         return (self.entry_notional_cap(), self.position_size, self.close_target_mode,
                 json.dumps({k: self.config.get(k) for k in
-                            ('risk', 'entry_policy', 'close_policy', 'spread_threshold', 'position_policy', 'execution_filters')}, sort_keys=True),
+                            ('trading', 'risk', 'entry_policy', 'close_policy', 'spread_threshold', 'position_policy', 'execution_filters')}, sort_keys=True),
                 tuple((p.id, p.status, p.variational_size, p.lighter_size) for p in self.positions if p.status != 'closed'))
 
     def prepare_entry_candidate(self, opportunity):
@@ -1724,6 +1762,7 @@ class ArbitrageStrategy(EntryLimitsMixin, PositionRoutesMixin, TargetReturnMixin
                 # These are independent read-only account checks. Run them
                 # together so the slower account does not add to the faster
                 # account's latency; both still complete before any submit.
+                capital_policy = self.entry_capital_policy()
                 def account_check(name, trader, side):
                     with stage(self.history, name, opportunity.symbol):
                         if self.parallel_discovery:
@@ -1732,8 +1771,11 @@ class ArbitrageStrategy(EntryLimitsMixin, PositionRoutesMixin, TargetReturnMixin
                                 allow_resize=True, quantity_step=step,
                                 reference_price=max(float(quote['bid']), float(quote['ask'])),
                                 cost_bps=max(0, float(self.slippage_tolerance)) +
-                                         max(0, float(quote.get('fee_bps') or 0)))
+                                         max(0, float(quote.get('fee_bps') or 0)),
+                                **({'capital_policy': capital_policy} if capital_policy is not None else {}))
                         else:
+                            if capital_policy is not None:
+                                raise ValueError('当前平台不支持资金预算预检，首腿未提交')
                             trader.validate_order(opportunity.symbol, quantity)
                 leverage_stage = '统一杠杆核验'
                 def leverage_check():
@@ -1758,7 +1800,8 @@ class ArbitrageStrategy(EntryLimitsMixin, PositionRoutesMixin, TargetReturnMixin
                             trader.resize_entry_precheck(opportunity.symbol, paired_quantity, side)
                         self.history.append('entry_balance_resized', symbol=opportunity.symbol,
                             requested_quantity=quantity, quantity=float(paired_quantity),
-                            reason='按双边可用保证金统一缩量，随后重新核验同数量报价、最低金额及净收益')
+                            **({'capital_policy':capital_policy} if capital_policy is not None else {}),
+                            reason='按双边可用资金及预留预算统一缩量，随后重新核验同数量报价、最低金额及净收益')
                         quantity = float(paired_quantity)
                 # Leverage is a separate signed account setting on Lighter;
                 # it is deliberately applied only after both accounts pass
@@ -1818,6 +1861,8 @@ class ArbitrageStrategy(EntryLimitsMixin, PositionRoutesMixin, TargetReturnMixin
                 position.entry_target_projection = copy.deepcopy(selected.get('target_projection'))
                 self._grid_attach(position, selected.get('grid_context'), selected['direction'])
                 self.positions.append(position)
+                self.opportunity_observer.begin(position.id,
+                    self._route_guard_key(position.symbol, selected['direction']), quantity)
                 self.last_trade_time = datetime.now()
                 self.daily_trades += 1  # Limit attempts, including rejected/rolled-back ones.
                 self._save()  # Persist intent BEFORE a potentially ambiguous submission.
@@ -1897,7 +1942,10 @@ class ArbitrageStrategy(EntryLimitsMixin, PositionRoutesMixin, TargetReturnMixin
                     return self._unwind(position, reason='首腿部分成交数量不符合第二腿数量步长', category='quantity')
                 # Requote after first fill. A quote for a different size cannot be reused.
                 current_stage = self._stage_venue_label(self.lighter_trader, 'L') + '提交对冲订单'
-                second_slippage = selected['buy_slippage_bps'] if direction else selected['sell_slippage_bps']
+                # After a confirmed fill, the return floor determines how
+                # much reserve can be consumed. Keep the user's hard order
+                # slippage cap instead of reapplying the smaller entry budget.
+                second_slippage = float(self.slippage_tolerance)
                 first_price = float(first['average_price'])
                 second_quote = None
                 second_price = None
@@ -2090,6 +2138,10 @@ class ArbitrageStrategy(EntryLimitsMixin, PositionRoutesMixin, TargetReturnMixin
                 self.execution_window_risk.outcome(self._route_guard_key(position.symbol, selected['direction']), 'paired',
                     filled * max(position.entry_price_variational, position.entry_price_lighter),
                     ceiling=selected.get('size_recovery_cap_usdc'))
+                self.opportunity_observer.outcome(position.id, 'paired',
+                    first_fill_price=position.entry_price_variational, second_fill_price=position.entry_price_lighter,
+                    filled_quantity=filled, first_submit_ms=timing.get('first_submit_ms'),
+                    first_receipt_to_second_send_ms=timing.get('first_receipt_to_second_send_ms'))
                 self._save()
                 self.history.append('hedged', symbol=position.symbol, position_id=position.id, quantity=filled,
                                     actual_spread_bps=position.actual_entry_spread_bps,
@@ -2154,6 +2206,9 @@ class ArbitrageStrategy(EntryLimitsMixin, PositionRoutesMixin, TargetReturnMixin
                 return False
 
             finally:
+                if position is not None:
+                    self.opportunity_observer.outcome(position.id, position.status,
+                        reason_code=position.rollback_category, stage=current_stage)
                 if quote_executor is not None:
                     # The first quote batch may still be completing after an
                     # early rejection/unwind.  Never wait for it on the hot

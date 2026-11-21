@@ -1,6 +1,7 @@
 """A third venue's catalog/failure cannot erase healthy pairs or change the active route."""
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from src.arcus.execution import ArcusExecutionAdapter
@@ -62,6 +63,19 @@ class MultiRouteDiscoveryTests(unittest.TestCase):
         self.b.get_market_price.side_effect = ValueError('missing')
         with self.assertRaises(ValueError):
             self.s.probe_reference_prices('BTC')
+
+    def test_execution_quality_uses_candidate_pair_and_direction_without_switching_routes(self):
+        self.routes()
+        self.s.activate_route(1)
+        original = (self.s.variational_trader, self.s.lighter_trader)
+        self.s.execution_window_risk.outcome('BTC|lighter_rh->arcus', 'paired', 12)
+        self.s.execution_window_risk.outcome('BTC|arcus->lighter_rh', 'zero_fill', 12)
+        op = SimpleNamespace(symbol='BTC', route_index=2, spread_direction='lighter_higher')
+        self.assertGreater(self.s.execution_quality_rank(op), .5)
+        op.spread_direction = 'variational_higher'
+        self.assertLess(self.s.execution_quality_rank(op), .5)
+        self.assertEqual(self.s._active_route_index, 1)
+        self.assertEqual((self.s.variational_trader, self.s.lighter_trader), original)
 
     def test_missing_third_feed_gets_probe_even_when_first_pair_has_fresh_quotes(self):
         self.routes()

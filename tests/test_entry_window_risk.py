@@ -44,6 +44,18 @@ class WindowEvidenceTests(unittest.TestCase):
         risk.observe('bad-price', 1e-310, 100, 100, 100, True, 1000)
         self.assertNotIn('bad-price', risk.routes)
 
+    def test_quality_ranks_only_recent_route_outcomes_without_changing_guards(self):
+        risk = ExecutionWindowRisk()
+        risk.outcome('a', 'paired', 12, 1000)
+        risk.outcome('b', 'zero_fill', 12, 1000)
+        self.assertGreater(risk.quality('a', 1000), risk.quality('unknown', 1000))
+        self.assertLess(risk.quality('b', 1000), risk.quality('unknown', 1000))
+        self.assertEqual(risk.quality('a', 1901), .5)
+        self.assertEqual(risk.quality('a', 999), .5)
+        restored = ExecutionWindowRisk(json.loads(json.dumps(risk.routes)))
+        self.assertEqual(restored.quality('a', 1000), .5, 'ranking evidence adds no durable state payload')
+        self.assertTrue(restored.evidence('b', 1000)['observation_only'])
+
     def test_size_only_reduces_for_known_liquidity_outcomes_and_restores_gradually(self):
         risk = ExecutionWindowRisk()
         for reason in ('edge', 'price', 'timeout', 'amount', 'rejected', 'unknown'):

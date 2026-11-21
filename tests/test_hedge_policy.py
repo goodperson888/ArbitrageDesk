@@ -107,6 +107,7 @@ class HedgeRecoveryTests(unittest.TestCase):
                        'risk': {'slippage_tolerance': 10},
                        'wash_trading': {'trade_interval_min': 0, 'max_trades_per_day': 100}}
         self.strategy = ArbitrageStrategy(self.config, self.first, self.second)
+        self.addCleanup(self.strategy.close_diagnostics.writer.flush, 1)
         from src.api_v2.center_statistics import close_service
         self.addCleanup(close_service, self.strategy.market_history)
         self.opportunity = ArbitrageOpportunity('UNI', 100.2, 100, 20, 'variational_higher', 0, datetime.now())
@@ -122,7 +123,7 @@ class HedgeRecoveryTests(unittest.TestCase):
     def fail_one(self):
         self.second.price = 100
         # Actual price movement must still respect the configured boundary.
-        budget = self.strategy.execution_entry_movement_bps('UNI', 'sell_variational')
+        budget = self.strategy.slippage_tolerance
         with self.move_after_first(100 * (1 + (budget + 1) / 10000)):
             self.assertFalse(self.strategy.execute_arbitrage(self.opportunity))
 
@@ -169,11 +170,31 @@ class HedgeRecoveryTests(unittest.TestCase):
         self.assertGreaterEqual(decision['net_edge_bps'], 5 - 1e-7)
         self.assertLess(decision['net_edge_bps'], self.strategy.execution_min_bps('UNI'))
 
-    def test_move_outside_reserved_budget_does_not_chase_price(self):
+    def test_move_outside_hard_slippage_budget_does_not_chase_price(self):
         self.fail_one()
         self.assertEqual(self.second.sends, [])
         self.assertEqual(self.strategy.positions[-1].status, 'closed')
         self.assertEqual(next(iter(self.strategy.route_rollback_guards.values()))['rollback_count'], 1)
+
+    def test_second_leg_can_spend_reserve_beyond_small_budget_in_both_directions(self):
+        for a,b,moved in ((100.2,100,100.06),(100,100.2,100.14)):
+            with self.subTest(first=a):
+                self.strategy.positions.clear()
+                self.first.sends.clear(); self.second.sends.clear()
+                self.first.price,self.second.price=a,b
+                with self.move_after_first(moved):
+                    self.assertTrue(self.strategy.execute_arbitrage(self.opportunity))
+                self.assertEqual(len(self.second.sends),1)
+                decision=next(e['detail'] for e in self.strategy.history.recent() if e['event']=='hedge_decision')
+                self.assertGreater(decision['observed_net_edge_bps'],5)
+
+    def test_remaining_profit_floor_still_blocks_within_hard_slippage_cap(self):
+        self.first.price=100.1
+        with self.move_after_first(100.06):
+            self.assertFalse(self.strategy.execute_arbitrage(self.opportunity))
+        self.assertEqual(self.second.sends,[])
+        decision=next(e['detail'] for e in self.strategy.history.recent() if e['event']=='hedge_decision')
+        self.assertLess(decision['observed_net_edge_bps'],5)
 
     def test_no_extra_window_simulation_veto_after_configured_plan_passes(self):
         # The sized plan passes the configured floor. A hypothetical extra

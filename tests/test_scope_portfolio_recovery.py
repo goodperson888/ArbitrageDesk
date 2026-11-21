@@ -55,6 +55,18 @@ class ScopePortfolioRecoveryTests(unittest.TestCase):
             self.reconcile()
         self.assertFalse(json.loads(self.path.read_text()).get('resume_verified',False))
 
+    def test_legacy_unsent_close_is_repaired_only_after_portfolio_account_match(self):
+        recovery.PositionRecoveryTests.legacy_unsent_close(self)
+        self.mixed()
+        self.state['positions'][1].update(close_attempts={}, close_order_results={}, close_started_time=None)
+        self.write_state()
+        self.assertTrue(self.reconcile()['resume_ready'])
+        saved = json.loads(self.path.read_text())
+        result = saved['positions'][0]['close_order_results']['lighter']
+        self.assertTrue(result['confirmed'])
+        self.assertIs(result['submitted'], False)
+        self.assertTrue(resume_proof_valid(saved, ['lighter', 'arcus']))
+
     def test_local_symbols_flat_but_other_exposure_cannot_claim_accounts_flat(self):
         self.mixed()
         self.account['positions'] = [dict(market_id=99,position='1',sign=1,open_order_count=0)]

@@ -79,6 +79,41 @@ class PendingStopTests(unittest.TestCase):
         self.strategy.close_position.assert_called_once()
         self.worker.stop_event.wait.assert_not_called()
 
+    def test_unknown_close_keeps_other_holdings_visible_without_more_order_calls(self):
+        self.worker.kill_path.unlink()
+        self.position.status = 'open'
+        other = SimpleNamespace(id='other-position', status='open')
+        self.strategy.positions.append(other)
+        self.strategy.position_monitor = Mock()
+        self.strategy.close_reason.return_value = '价差收敛'
+        self.strategy.recover_single_leg_positions.return_value = 'blocked'
+
+        def unknown(position, **kwargs):
+            position.status = 'reconcile_required'
+            self.strategy.halted_reason = '平仓回执需核对：TimeoutError'
+
+        self.strategy.close_position.side_effect = unknown
+        self.worker.run(max_cycles=4)
+        self.strategy.close_position.assert_called_once_with(self.position, reason='价差收敛')
+        self.strategy.position_monitor.poll.assert_called_with([self.position, other])
+        self.assertEqual(self.strategy.position_monitor.poll.call_count, 4)
+        self.strategy.recover_single_leg_positions.assert_called_once()
+        self.strategy.execute_arbitrage.assert_not_called()
+        self.assertEqual(other.status, 'open')
+        events = [call.args[0] for call in self.strategy.history.append.call_args_list]
+        self.assertEqual(events.count('execution_reconciliation_waiting'), 1)
+
+    def test_readonly_halt_still_exits_promptly_on_explicit_stop(self):
+        self.worker.kill_path.unlink()
+        self.strategy.halted_reason = '平仓重试受阻：上一笔平仓终态未确认，禁止重发'
+        self.strategy.position_monitor = Mock()
+        self.strategy.recover_single_leg_positions.return_value = 'blocked'
+        self.strategy.position_monitor.poll.side_effect = lambda positions: self.worker.kill_path.touch()
+        self.worker.run(max_cycles=4)
+        self.strategy.position_monitor.poll.assert_called_once()
+        self.strategy.close_position.assert_not_called()
+        self.assertTrue(self.worker.kill_path.exists())
+
     def test_gone_worker_with_stop_unlocks_readonly_controls_without_flat_claim(self):
         console = ExecutionConsole(self.root, Diagnostics(self.root/'diagnostics.sqlite'))
         console._save({'state': 'running', 'pid': 123,

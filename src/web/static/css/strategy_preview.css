@@ -1,6 +1,8 @@
 .strategy-preview-dialog [hidden]{display:none!important}
 .strategy-preview-layout:has(.strategy-preview-controls[hidden]){grid-template-columns:minmax(0,1fr)}
 .strategy-preview-dialog button,.strategy-preview-dialog input,.strategy-preview-dialog select{min-height:44px}
+.strategy-preview-dialog .field-help-icon{min-height:24px;min-width:24px;width:24px;height:24px;transform:none}
+.field-help-tooltip{position:fixed;z-index:20;box-sizing:border-box;padding:8px 10px;border:1px solid #34445b;border-radius:6px;background:#111b2a;color:#d9e5f2;font-size:12px;line-height:1.5;white-space:normal;overflow-wrap:anywhere;overflow:auto;pointer-events:none;box-shadow:0 8px 24px #0008}
 .strategy-quick-view{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:12px 0;padding:10px 14px;border:1px solid var(--border,#293344);border-radius:10px;font-size:13px}
 .strategy-preview-dialog{width:min(1140px,calc(100vw - 32px));max-height:92vh;padding:0;border:1px solid #334155;border-radius:16px;background:#111925;color:#e5edf6;overflow:auto}
 .strategy-preview-dialog::backdrop{background:rgba(2,6,15,.74)}

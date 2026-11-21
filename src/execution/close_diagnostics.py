@@ -61,19 +61,29 @@ class DiagnosticWriter:
             self.dropped += 1
             return False
 
-    def _write(self, path, snapshot):
+    def submit_entry(self, path, snapshot):
+        try:
+            self.queue.put_nowait((path, snapshot, 'entry_observations'))
+            return True
+        except queue.Full:
+            self.dropped += 1
+            return False
+
+    def _write(self, path, snapshot, table='close_decisions'):
         # This database has no order intents or receipts: a slow diagnostic
         # writer cannot acquire their SQLite write lock.
         if not path.parent.exists():
             raise OSError('diagnostic directory unavailable')
+        if table not in ('close_decisions', 'entry_observations'):
+            raise ValueError('unknown diagnostic table')
         with sqlite3.connect(path, timeout=.05) as db:
             db.execute('PRAGMA journal_mode=WAL')
             db.execute('PRAGMA synchronous=NORMAL')
-            db.execute('CREATE TABLE IF NOT EXISTS close_decisions ('
+            db.execute('CREATE TABLE IF NOT EXISTS '+table+' ('
                        'id INTEGER PRIMARY KEY, position_id TEXT, observed_at TEXT, detail TEXT)')
-            db.execute('CREATE INDEX IF NOT EXISTS close_decisions_position '
-                       'ON close_decisions(position_id,id DESC)')
-            db.execute('INSERT INTO close_decisions(position_id,observed_at,detail) VALUES(?,?,?)',
+            db.execute('CREATE INDEX IF NOT EXISTS '+table+'_position '
+                       'ON '+table+'(position_id,id DESC)')
+            db.execute('INSERT INTO '+table+'(position_id,observed_at,detail) VALUES(?,?,?)',
                        (snapshot['position_id'], snapshot['observed_at'],
                         json.dumps(snapshot, ensure_ascii=False, allow_nan=False)))
 

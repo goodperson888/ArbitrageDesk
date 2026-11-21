@@ -20,6 +20,34 @@ from test_spread_grid import GridTrader
 
 
 class ExecutionLatencyTests(unittest.TestCase):
+    def test_fresh_native_books_build_exact_quantity_without_rest_or_executor(self):
+        from src.lighter.execution import LighterExecutionAdapter
+        stamp=utc_now()
+        books={t.venue:dict(fetched_at=stamp,bids=[dict(price=100,size=2)],asks=[dict(price=101,size=2)])
+               for t in (self.a,self.b)}
+        self.a.verified_fee_bps=self.b.verified_fee_bps=0
+        with patch.object(GridTrader,'cached_sizing_book',lambda t,s,q:books[t.venue],create=True), \
+                patch.object(GridTrader,'quote_from_sizing_book',LighterExecutionAdapter.quote_from_sizing_book,create=True), \
+                patch('src.strategy.arbitrage_strategy.ThreadPoolExecutor',side_effect=AssertionError('unneeded pool')):
+            quotes=self.s._quotes('SUI',1.5,record_stages=False)
+        self.assertEqual([q['size'] for q in quotes],[1.5,1.5])
+        self.assertEqual([q['updated_at'] for q in quotes],[stamp,stamp])
+        self.assertEqual(self.a.quote_reads+self.b.quote_reads,0)
+
+    def test_stale_or_insufficient_native_depth_falls_back_only_for_missing_leg(self):
+        from src.lighter.execution import LighterExecutionAdapter
+        self.a.verified_fee_bps=self.b.verified_fee_bps=0
+        fresh=dict(fetched_at=utc_now(),bids=[dict(price=100,size=2)],asks=[dict(price=101,size=2)])
+        for bad in (dict(fresh,fetched_at='2000-01-01T00:00:00Z'),
+                    dict(fresh,asks=[dict(price=101,size=.1)])):
+            with self.subTest(book=bad):
+                self.a.quote_reads=self.b.quote_reads=0
+                with patch.object(GridTrader,'cached_sizing_book',lambda t,s,q:fresh if t is self.a else bad,create=True), \
+                        patch.object(GridTrader,'quote_from_sizing_book',LighterExecutionAdapter.quote_from_sizing_book,create=True):
+                    quotes=self.s._quotes('SUI',1,record_stages=False)
+                self.assertEqual([q['size'] for q in quotes],[1,1])
+                self.assertEqual((self.a.quote_reads,self.b.quote_reads),(0,1))
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)

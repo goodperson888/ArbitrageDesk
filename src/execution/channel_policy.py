@@ -4,7 +4,7 @@ from src.execution.target_return import finite, directed_spread, exit_projection
 
 DEFAULTS = dict(method='quantile', window_seconds=3600, quantile=90., multiplier=2.,
     min_samples=30, min_width_bps=0., max_width_bps=0., lower_bps=-20., upper_bps=20.,
-    exit_mode='reversion', reversion_percent=60.)
+    exit_mode='reversion', reversion_percent=60., touch_tolerance_bps=2., touch_min_count=3)
 
 
 def channel_policy(config):
@@ -12,18 +12,19 @@ def channel_policy(config):
     if not isinstance(raw, dict) or set(raw) - set(DEFAULTS):
         raise ValueError('通道配置项无效')
     p = dict(DEFAULTS, **raw)
-    if p['method'] not in ('quantile', 'bollinger', 'robust', 'fixed'):
+    if p['method'] not in ('quantile', 'bollinger', 'robust', 'fixed', 'touches'):
         raise ValueError('通道类型无效')
     if p['exit_mode'] not in ('reversion', 'opposite'):
         raise ValueError('通道退出模式无效')
-    limits = dict(window_seconds=(900,604800), quantile=(50.1,99.9), multiplier=(.1,10),
+    limits = dict(window_seconds=(900,7776000), quantile=(50.1,99.9), multiplier=(.1,10),
         min_samples=(30,100000), min_width_bps=(0,10000), max_width_bps=(0,10000),
-        lower_bps=(-9999,9999), upper_bps=(-9999,9999), reversion_percent=(.1,100))
+        lower_bps=(-9999,9999), upper_bps=(-9999,9999), reversion_percent=(.1,100),
+        touch_tolerance_bps=(.1,100), touch_min_count=(2,50))
     for key, (low,high) in limits.items():
         p[key] = finite(p[key], '通道参数 '+key)
         if not low <= p[key] <= high:
             raise ValueError('通道参数超出范围: '+key)
-    for key in ('window_seconds','min_samples'):
+    for key in ('window_seconds','min_samples','touch_min_count'):
         if int(p[key]) != p[key]:
             raise ValueError('通道窗口和样本数须为整数')
         p[key] = int(p[key])
@@ -37,6 +38,67 @@ def channel_policy(config):
         if config.get('position_policy',{}).get('mode','single') != 'single':
             raise ValueError('通道策略使用单开持仓；同一组合结束后才可反向')
     return p
+
+
+def touch_statistics(rows, tolerance, minimum):
+    """Independent confirmed swings, clustered in bounded price zones.
+
+    A reversal of two tolerances confirms a turn; a plateau counts once.
+    Missing periods never supply an invented reversal. This runs only in
+    the background statistics worker, never on the order path.
+    """
+    tolerance, minimum = float(tolerance), int(minimum)
+    turns = {'upper': [], 'lower': []}
+    direction = 0
+    low = high = None
+    previous = None
+    for stamp, value in rows:
+        if previous is None or stamp - previous > 120:
+            direction, low, high = 0, (stamp, value), (stamp, value)
+        previous = stamp
+        if value > high[1]: high = (stamp, value)
+        if value < low[1]: low = (stamp, value)
+        if direction == 0:
+            # The first endpoint has no observed approach; establish a trend
+            # before counting a confirmed reversal as an independent touch.
+            if value-low[1] >= 2*tolerance:
+                direction, high = 1, (stamp, value)
+            elif high[1]-value >= 2*tolerance:
+                direction, low = -1, (stamp, value)
+            continue
+        if direction >= 0 and high[1] - value >= 2 * tolerance:
+            turns['upper'].append(high)
+            direction, low = -1, (stamp, value)
+        elif direction <= 0 and value - low[1] >= 2 * tolerance:
+            turns['lower'].append(low)
+            direction, high = 1, (stamp, value)
+    zones = {}
+    end = rows[-1][0] if rows else 0
+    span = max(1, end - rows[0][0]) if rows else 1
+    for side, points in turns.items():
+        # Confirmed same-side turns already have an intervening excursion
+        # of two tolerances. A sliding window avoids quadratic clustering.
+        ordered = sorted(points, key=lambda p:p[1])
+        prefix = [0.]
+        for stamp,_ in ordered:
+            prefix.append(prefix[-1] + 1 + (stamp-rows[0][0])/span)
+        best, right = None, 0
+        for left, point in enumerate(ordered):
+            while right < len(ordered) and ordered[right][1]-point[1] <= 2*tolerance:
+                right += 1
+            if right-left >= minimum:
+                score = prefix[right]-prefix[left]
+                if best is None or score > best[0]: best = (score,left,right)
+        if best is None:
+            zones[side] = None
+            continue
+        score,left,right = best
+        cluster = ordered[left:right]
+        zones[side] = dict(value_bps=cluster[len(cluster)//2][1],
+            low_bps=cluster[0][1],high_bps=cluster[-1][1],count=len(cluster),
+            last_touch_at=max(t for t,_ in cluster),score=score,
+            points=[dict(timestamp=t,value_bps=v) for t,v in sorted(cluster)[-64:]])
+    return dict(tolerance_bps=tolerance,min_count=minimum,**zones)
 
 
 def sample_statistics(rows, quantile):
@@ -78,7 +140,16 @@ def channel_bounds(policy, stats):
         if samples < p['min_samples'] or float(s.get('sample_span_seconds') or 0) < 870:
             raise ValueError(f'通道有效样本不足或覆盖不足14.5分钟: {samples}/{p["min_samples"]}')
         center = finite(s.get('mean_bps' if p['method']=='bollinger' else 'center_bps'),'通道中心')
-        if p['method'] == 'quantile':
+        if p['method'] == 'touches':
+            touches = s.get('touch_statistics') or {}
+            if (touches.get('tolerance_bps') != p['touch_tolerance_bps'] or
+                    touches.get('min_count') != p['touch_min_count'] or
+                    not touches.get('upper') or not touches.get('lower')):
+                raise ValueError('反复触碰通道尚未形成有效上下沿，等待独立触碰')
+            lower, upper = touches['lower']['value_bps'], touches['upper']['value_bps']
+            if lower >= upper or not lower <= center <= upper:
+                raise ValueError('反复触碰通道尚未形成有效上下沿，等待独立触碰')
+        elif p['method'] == 'quantile':
             lower,upper = finite(s.get('lower_bps'),'下边界'),finite(s.get('upper_bps'),'上边界')
         else:
             scale = finite(s.get('stdev_bps' if p['method']=='bollinger' else 'mad_bps'),'通道波动',0)
@@ -95,8 +166,36 @@ def channel_bounds(policy, stats):
         raise ValueError(f'通道宽度 {width:.2f} bps 超过允许上限，暂不入场')
     if not -9999 < lower <= center <= upper < 9999:
         raise ValueError('通道边界无效')
-    return dict(lower_bps=lower, upper_bps=upper, center_bps=center, width_bps=width,
+    result = dict(lower_bps=lower, upper_bps=upper, center_bps=center, width_bps=width,
         samples=samples, method=p['method'], window_seconds=p['window_seconds'])
+    if p['method'] == 'touches': result['touch_statistics'] = touches
+    return result
+
+
+def channel_stats_for(history, symbol, route, policy):
+    from src.api_v2.center_statistics import center_stats_for, service_for
+    args = (symbol, route, policy['window_seconds'], policy['quantile'])
+    if policy['method'] == 'touches':
+        return service_for(history).get(*args, touch_tolerance_bps=policy['touch_tolerance_bps'],
+                                       touch_min_count=policy['touch_min_count'])
+    return center_stats_for(history, *args)
+
+
+def channel_target_bps(side, target, a, b):
+    """Express a frozen A-ask/B-bid target in today's trade direction.
+
+    Only the canonical target is frozen. Its reverse-route representation
+    must follow current quote widths, or the modeled exit moves off target.
+    """
+    target = finite(target, '通道平仓目标')
+    if side == 'upper':
+        return target
+    if side != 'lower':
+        raise ValueError('通道方向无效')
+    projection = exit_projection(dict(a, fee_bps=0), dict(b, fee_bps=0), target, 0, 0, 0)
+    a_bid = projection['target_buy_ask'] * float(a['bid']) / float(a['ask'])
+    b_ask = projection['target_sell_bid'] * float(b['ask']) / float(b['bid'])
+    return directed_spread(b_ask, a_bid)
 
 
 def channel_context(policy, bounds, a, b, *, upper_direction, symbol, route, axis_venues, require_boundary=True):
@@ -114,12 +213,7 @@ def channel_context(policy, bounds, a, b, *, upper_direction, symbol, route, axi
         if policy['exit_mode']=='opposite' else current+(center-current)*policy['reversion_percent']/100)
     # A reverse B-long/A-short target is NOT simply -target: both venue
     # bid/ask widths must survive the coordinate conversion.
-    directed_target = target
-    if not upper_direction:
-        projection = exit_projection(dict(a,fee_bps=0),dict(b,fee_bps=0),target,0,0,0)
-        a_bid = projection['target_buy_ask']*float(a['bid'])/float(a['ask'])
-        b_ask = projection['target_sell_bid']*float(b['ask'])/float(b['bid'])
-        directed_target = directed_spread(b_ask,a_bid)
+    directed_target = channel_target_bps('upper' if upper_direction else 'lower', target, a, b)
     return dict(version=2,symbol=symbol,route=route,target_mode='channel',target_policy_mode='channel',
         target_bps=directed_target,center_bps=None,samples=bounds['samples'],
         window_seconds=policy['window_seconds'],channel=dict(bounds,policy=dict(policy),

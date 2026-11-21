@@ -4,30 +4,71 @@ import threading
 import re
 import json
 import time
-from datetime import datetime, timezone
+from contextlib import contextmanager
+from datetime import datetime, timezone, timedelta
 import httpx
 import requests
 from urllib.parse import urlsplit
 from src.common.rate_limit import RateLimitGate
+from src.common.quote_clock import quote_clock, QuoteClockUnavailable
 
 
 class MarketDataError(RuntimeError):
     pass
 
 
+@contextmanager
+def request_slot(lock, timeout=None):
+    acquired = lock.acquire() if timeout is None else lock.acquire(timeout=timeout)
+    if not acquired:
+        raise MarketDataError('只读请求等待超时，稍后重试')
+    try:
+        yield
+    finally:
+        lock.release()
+
+
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def normalize_quote_time(observed, received, max_future_seconds=0.5):
-    """Clamp a bounded server clock lead to receipt time, preserving old ages.
+def normalize_quote_time(observed, received, max_future_seconds=0.5, *, received_monotonic=None):
+    """Map exchange UTC into the local receipt clock, preserving old ages.
 
     Only call on a newly received quote (or its original cached receipt).
     Never use the current clock to renew an existing cached quote.
     """
+    try:
+        offset, uncertainty = quote_clock.correction(received, received_monotonic)
+    except QuoteClockUnavailable as exc:
+        raise MarketDataError(str(exc)) from None
+    observed = observed-timedelta(seconds=offset)
     if (observed - received).total_seconds() > max_future_seconds:
+        if quote_clock.status().get('calibrating'):
+            raise MarketDataError('行情后台校时中，等待可靠时间源')
         raise MarketDataError('行情时间超前，等待同步报价')
-    return min(observed, received)
+    return min(observed-timedelta(seconds=uncertainty), received)
+
+
+def cached_quote_age(age, observed_monotonic=None):
+    """A wall-clock adjustment must never extend a received quote's life."""
+    if observed_monotonic is None:
+        return age
+    elapsed = time.monotonic()-observed_monotonic
+    if not math.isfinite(elapsed) or elapsed < 0:
+        return None
+    return max(age, elapsed) if age is not None else None
+
+
+def cached_quote_time(timestamp, observed_monotonic=None):
+    """Expose monotonic age to downstream consumers of ISO timestamps too."""
+    if observed_monotonic is None:
+        return timestamp
+    age = age_seconds(timestamp)
+    elapsed = time.monotonic()-observed_monotonic
+    if age is not None and math.isfinite(elapsed) and elapsed >= 0 and elapsed-age > .01:
+        return (datetime.now(timezone.utc)-timedelta(seconds=elapsed)).isoformat()
+    return timestamp
 
 
 def number(value, positive=False):
@@ -84,11 +125,11 @@ class PublicClient:
         self._key_locks = tuple(threading.RLock() for _ in range(32))
         self.rate_limit = RateLimitGate(self.base_url)
 
-    def get(self, path, params=None, ttl=None, discovery=False):
+    def get(self, path, params=None, ttl=None, discovery=False, *, request_timeout=None):
         key = (path, tuple(sorted((params or {}).items())))
         # Keep one in-flight read per key; a slow optional market request
         # must not hold a global lock over account/other-market requests.
-        with self._key_locks[hash(key) % len(self._key_locks)]:
+        with request_slot(self._key_locks[hash(key) % len(self._key_locks)],request_timeout):
             now = time.monotonic()
             rejected = self._http_rejections.get(key)
             if rejected and now < rejected[0]:
@@ -118,10 +159,12 @@ class PublicClient:
                 for attempt in range(2):
                     try:
                         if isinstance(request_session, httpx.Client):
-                            response = request_session.get(self.base_url + path, params=params)
+                            options = ({'timeout':httpx.Timeout(request_timeout,connect=min(2,request_timeout),pool=.5)}
+                                       if request_timeout is not None else {})
+                            response = request_session.get(self.base_url + path, params=params,**options)
                         else:
                             response = request_session.get(self.base_url + path, params=params,
-                                                           timeout=(5, self.request_timeout))
+                                                           timeout=(min(5,request_timeout or 5), request_timeout or self.request_timeout))
                         self.rate_limit.reject(response)
                         response.raise_for_status()
                         break

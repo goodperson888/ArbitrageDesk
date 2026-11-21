@@ -71,6 +71,7 @@ class ConfigLoader:
             'spread_threshold': {'min': (0, 10000), 'max': (0, 10000)},
             'trading': {'position_size': (1, 1000000), 'max_positions': (1, 100),
                         'max_total_position_notional': (0, 1000000),
+                        'capital_reserve_percent': (0, 99), 'capital_reserve_usdc': (0, 1000000),
                         'leverage': (1, 100), 'second_leg_retries': (0, 2)},
             'wash_trading': {'min_trades_per_day': (0, 10000), 'max_trades_per_day': (1, 10000)},
             'risk': {'max_loss_per_trade': (0.01, 1000000), 'max_daily_loss': (0.01, 1000000),
@@ -92,17 +93,17 @@ class ConfigLoader:
                 'quantile': (50, 99.9),
                 'min_samples': (30, 100000),
                 'calculation_version': (2, 2),
-                'target_window_seconds': (300, 604800),
+                'target_window_seconds': (300, 7776000),
                 'funding_reserve_bps': (0, 10000),
                 'funding_hold_seconds': (60, 604800),
                 'funding_extra_bps': (0, 10000),
             },
             'position_policy': {'step_bps': (.1, 10000), 'max_layers': (1, 100),
                                 'layer_notional_usdc': (1, 1000000), 'total_notional_usdc': (1, 1000000)},
-            'channel_policy': {'window_seconds': (900,604800), 'quantile': (50.1,99.9),
+            'channel_policy': {'window_seconds': (900,7776000), 'quantile': (50.1,99.9),
                 'multiplier': (.1,10), 'min_samples': (30,100000), 'min_width_bps': (0,10000),
                 'max_width_bps': (0,10000), 'lower_bps': (-9999,9999), 'upper_bps': (-9999,9999),
-                'reversion_percent': (.1,100)},
+                'reversion_percent': (.1,100), 'touch_tolerance_bps': (.1,100), 'touch_min_count': (2,50)},
         }
         close_modes = {'convergence', 'profit', 'convergence_and_profit',
                        'convergence_or_profit', 'disabled'}
@@ -119,8 +120,13 @@ class ConfigLoader:
             if group not in allowed or not isinstance(values, dict):
                 raise ValueError('不支持的配置项: ' + group)
             for key, value in values.items():
+                if group == 'trading' and key == 'capital_allocation_mode':
+                    if value not in ('per_leg', 'remaining_slots'):
+                        raise ValueError('资金分配模式无效')
+                    target.setdefault(group, {})[key] = value
+                    continue
                 if group == 'channel_policy' and key in ('method','exit_mode'):
-                    choices = ('quantile','bollinger','robust','fixed') if key=='method' else ('reversion','opposite')
+                    choices = ('quantile','bollinger','robust','fixed','touches') if key=='method' else ('reversion','opposite')
                     if value not in choices:
                         raise ValueError('通道类型或退出模式无效')
                     target.setdefault(group, {})[key] = value

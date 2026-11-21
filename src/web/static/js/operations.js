@@ -35,6 +35,7 @@
     let pending = false, strategyDirty = false;
     const strategyControlIds = ['position-mode','grid-step','grid-max-layers','grid-layer-notional','grid-total-notional','position-size','max-positions','leverage','second-leg-retries','loss-limits','slippage','max-trades','execution-entry-mode','execution-entry-quantile','execution-entry-min-samples','execution-target-window','execution-funding-reserve','execution-funding-mode','execution-funding-hold','execution-funding-extra','execution-close-target','min-spread','max-spread','execution-safety-margin','execution-price-movement','hedge-max-delay','route-rollback-limit','route-rollback-cooldown','close-mode','close-convergence-basis','close-convergence-bps','close-min-profit-usdc','close-min-profit-bps','close-cost-reserve-usdc','close-max-hold-minutes','max-total-position-notional'];
     strategyControlIds.push('book-utilization','channel-method','channel-window','channel-quantile','channel-multiplier','channel-min-samples','channel-min-width','channel-max-width','channel-lower','channel-upper','channel-exit-mode','channel-reversion');
+    strategyControlIds.push('capital-allocation-mode','capital-reserve-percent','capital-reserve-usdc');
     const CHECK_WINDOW_MS = 120000;
     let checkedUntil = 0, checking = false, armed = false, stopped = false, running = false, stopRequested = false;
     let latestOperations = null, checkedScopeKey = null, checkedExecutionPair = null;
@@ -120,7 +121,9 @@
         if (!node) return;
         const saved = savedEntryLimits;
         const active = execution?.position_monitor?.entry_limits;
-        const describe = value => `${value.max_positions} 组 / 总额 ${Number(value.max_total_position_notional)>0 ? value.max_total_position_notional+' USDC' : '不限'} / 每腿 ${value.position_size} USDC`;
+        const describe = value => `${value.max_positions} 组 / 总额 ${Number(value.max_total_position_notional)>0 ? value.max_total_position_notional+' USDC' : '不限'} / 每腿 ${value.position_size} USDC`+
+            (Number(value.capital_reserve_percent)||Number(value.capital_reserve_usdc)||value.capital_allocation_mode==='remaining_slots'
+                ? ` / 每平台预留 max(${value.capital_reserve_percent||0}%, ${value.capital_reserve_usdc||0} U)`+(value.capital_allocation_mode==='remaining_slots'?' / 按剩余名额分配':'') : '');
         if (!execution?.running) {
             node.textContent = saved ? '已保存：'+describe(saved)+'；下次启动使用。' : '持仓上限：正在读取配置…';
         } else if (!active || active.version !== 1) {
@@ -128,12 +131,16 @@
         } else {
             const pending = saved && (Number(saved.max_positions)!==Number(active.max_positions) ||
                 Number(saved.max_total_position_notional)!==Number(active.max_total_position_notional) ||
-                Number(saved.position_size)!==Number(active.saved_position_size));
+                Number(saved.position_size)!==Number(active.saved_position_size) ||
+                ['capital_reserve_percent','capital_reserve_usdc'].some(key=>Number(saved[key]||0)!==Number(active[key]||0)) ||
+                (saved.capital_allocation_mode||'per_leg')!==(active.capital_allocation_mode||'per_leg'));
             node.textContent = `${execution.position_monitor.heartbeat_stale ? '上次上报（心跳待核验）' : '本次生效'}：${describe(active)}；当前 ${active.active_groups} 组。`+
                 (pending ? ' 已保存：'+describe(saved)+'；等待下次开仓检查应用。' : '')+
                 (active.single_position_cycle ? ' 当前仍为旧单仓循环；修改并保存最大组数后切换为按上限运行。' : '')+
                 (active.execution_notional_cap!=null ? ` 本次每腿仍不超过启动上限 ${active.execution_notional_cap} USDC。` : '')+
                 (active.pending_other_settings ? ' 其他策略修改待全部平仓后生效。' : '')+
+                (pending && active.capital_policy_version!==1 && (saved.capital_reserve_percent || saved.capital_reserve_usdc || saved.capital_allocation_mode==='remaining_slots')
+                    ? ' 当前工作进程未加载资金预留功能；请在本次执行安全结束后启动新版。' : '')+
                 (execution.close_only || execution.stop_requested ? ' 本次已暂停新开仓，保存上限不会恢复开仓。' : '');
             if (execution.mode && execution.mode !== 'continuous_monitor') node.textContent += ' 本次为单次验证，不会因调高上限追加组。';
         }
@@ -697,6 +704,10 @@
         } else if (!execution?.running && execution?.stop_requires_reconcile && execution?.stop_requested) {
             tone='waiting'; heading='全局实盘已停止 · 仓位待核对';
             message='工作进程已退出，原仓位和停止保护已保留；不代表已平仓。点击“核对原仓位（只读）”，核对通过后重新只读检查，再手动开启实盘接管。';
+        } else if (execution?.running && execution.position_monitor?.read_only &&
+                execution.position_monitor.stop_reason && !execution.position_monitor.heartbeat_stale) {
+            tone='rejected'; heading='自动下单已暂停 · 持仓只读监控中';
+            message=execution.position_monitor.stop_reason+'；行情与账户继续更新，自动开平仓已锁定。请停止本次执行，核对原订单后恢复监控。';
         } else if (execution?.running && execution?.recovery_blocked) {
             tone='waiting'; heading='原仓位待接管 · 需重新核对';
             message='进程正在运行，但旧仓位仍为待核对状态，不能视为已接管。请停止旧进程后，重新只读检查并开启实盘。';
@@ -708,6 +719,41 @@
                 (execution.managed_positions?.length?'已接管 '+execution.managed_positions.map(p=>p.symbol).join('、')+'；继续按平仓规则监控。':'')+
                 (event?'最新进度：'+executionEventText(event)+'。':'')+
                 '要改为自动开仓与平仓，先结束本次运行，再选择模式、重新只读检查并手动启动。';
+        } else if (execution?.running && !execution?.stop_requested &&
+                execution.position_monitor?.entry_paused && !execution.position_monitor.heartbeat_stale) {
+            tone='waiting'; heading='新开仓暂停 · 持仓核验受阻';
+            const positions=execution.position_monitor.positions||[];
+            const pending=positions.find(p=>p.account_status!=='ready');
+            const quoteBlocked=!pending && positions.find(p=>/报价|行情|盘口/.test(p.error||'') ||
+                Object.values(p.legs||{}).some(leg=>leg.error));
+            if (quoteBlocked) {
+                heading='新开仓暂停 · 持仓行情受阻';
+                const venueNames={lighter:'Lighter 主网',lighter_rh:'Lighter RH',arcus:'Arcus',standx:'StandX',variational:'Variational'};
+                const errors=Object.values(quoteBlocked.legs||{}).filter(leg=>leg.error)
+                    .map(leg=>(venueNames[leg.venue]||leg.venue||'平台')+'：'+leg.error);
+                message=quoteBlocked.symbol+' · '+(errors.join('；')||quoteBlocked.error)+
+                    '；后台重试中，行情及持仓核验恢复后自动继续扫描。';
+                if (message.includes('行情后台校时中')) {
+                    heading='新开仓暂停 · 后台校时中';
+                } else if (message.includes('时间超前')) {
+                    const calibrated=Object.values(quoteBlocked.legs||{}).some(leg=>leg.connection?.quote_clock?.ready);
+                    message+=calibrated?'内部校时已就绪，等待平台新报价。':'后台正在校时，无需调整本机时间。';
+                }
+            } else {
+                const venueNames={lighter:'Lighter 主网',lighter_rh:'Lighter RH',arcus:'Arcus',standx:'StandX',variational:'Variational'};
+                const affected=[...new Set(positions.filter(p=>p.account_status!=='ready').map(p=>p.symbol))];
+                const recovery=Object.values(pending?.legs||{}).filter(leg=>leg.account?.status==='pending').map(leg=>{
+                    const account=leg.account;
+                    return (venueNames[leg.venue]||leg.venue)+'：'+(account.error||'等待账户核验')+
+                        (Number.isFinite(account.blocked_for_seconds)?'，已持续 '+Math.floor(account.blocked_for_seconds)+' 秒':'')+
+                        (account.last_success_at?'，账户最近成功 '+date(account.last_success_at):'，尚无有效账户快照')+
+                        (account.reading?'，正在重试':Number.isFinite(account.retry_in_seconds)?'，'+Math.ceil(account.retry_in_seconds)+' 秒后重试':'');
+                });
+                message=(execution.position_monitor.entry_pause_reason ||
+                    (pending?.symbol ? pending.symbol+' 账户核验受阻，后台重试中' : '持仓监控待核验，后台重试中'))+
+                    '；核验恢复后自动继续扫描。'+(affected.length>1?'受影响持仓：'+affected.join('、')+'。':'')+
+                    (recovery.length?'原因：'+recovery.join('；'):pending?.account_errors?.length?'原因：'+pending.account_errors.join('；'):'');
+            }
         } else if (execution?.running && execution?.managed_positions?.length && !execution?.stop_requested) {
             const checkedAfterEvent=execution.position_monitor?.positions?.length && !execution.position_monitor.heartbeat_stale &&
                 execution.position_monitor.positions.every(p=>p.account_status==='ready' && Date.parse(p.last_success_at||'')>Date.parse(event?.timestamp||''));
@@ -747,7 +793,7 @@
                 ['stage_completed','stage_failed','wait_once_skipped'].includes(event?.event);
             const resolvedReference=lastRejection?.event==='stage_failed' &&
                 String(lastRejection.detail?.stage || '').endsWith(' 参考价格') && !referenceBlocker;
-            const waitingDetail=lastRejection && !resolvedReference ? '最近拦截：'+executionEventText(lastRejection)+
+            const waitingDetail=lastRejection && !resolvedReference ? '最近拦截（'+date(lastRejection.timestamp)+'）：'+executionEventText(lastRejection)+
                 (sameAttempt ? '；该次检查较优方向：'+executionEventText(lastQuote) : '') : '';
             const backoffUntil=Date.parse(execution.entry_scan_backoff_until || '');
             const backoffSeconds=Number.isFinite(backoffUntil) ? Math.max(0,Math.ceil((backoffUntil-Date.now())/1000)) : 0;
@@ -831,7 +877,8 @@
         detail.textContent=conciseMessage || compactStatusText(message) || message;
         detail.title=message;
         const monitorAt=execution?.running && execution?.position_monitor?.updated_at;
-        time.textContent=monitorAt?'监控更新 '+date(monitorAt):event?.timestamp?'最近更新 '+date(event.timestamp):execution?.finished_at?'结束于 '+date(execution.finished_at):'等待状态';
+        const scanAt=execution?.position_monitor?.entry_scan?.cached_scan?.updated_at;
+        time.textContent=monitorAt?'监控更新 '+date(monitorAt)+(scanAt?' · 最近扫描 '+date(scanAt):''):event?.timestamp?'最近更新 '+date(event.timestamp):execution?.finished_at?'结束于 '+date(execution.finished_at):'等待状态';
     }
     const invalidate = (reason='开关未解锁：请先点击“只读检查”。') => {
         checkedScopeKey=null;
@@ -940,7 +987,7 @@
             const recordedPair = latestOperations?.execution?.execution_pair ||
                 (Array.isArray(latestOperations?.execution?.venues) && latestOperations.execution.venues.length===2
                     ? latestOperations.execution.venues : null);
-            const resetPair = action==='reset-stop' && stopped &&
+            const resetPair = action==='reset-stop' && (stopped || latestOperations?.execution?.tracked_position_count>0) &&
                 Array.isArray(recordedPair) && recordedPair.length===2 ? recordedPair : null;
             const bestPair=action==='reset-stop' ? (resetPair || (selected.length===2 ? selected : null)) : selectedPair;
             if(action==='reset-stop' && (!bestPair || bestPair.length!==2)){
@@ -1419,7 +1466,9 @@
             globalThis.addEventListener('strategy-config-values-loaded', event=>{
                 const trading=event?.detail?.trading;
                 if(trading) savedEntryLimits={position_size:trading.position_size??100,
-                    max_positions:trading.max_positions??1,max_total_position_notional:trading.max_total_position_notional??0};
+                    max_positions:trading.max_positions??1,max_total_position_notional:trading.max_total_position_notional??0,
+                    capital_reserve_percent:trading.capital_reserve_percent??0,capital_reserve_usdc:trading.capital_reserve_usdc??0,
+                    capital_allocation_mode:trading.capital_allocation_mode??'per_leg'};
                 syncExecutionCapLimit();syncStrategySummary();renderEntryLimits();
             });
             globalThis.addEventListener('strategy-config-saved',()=>{strategyDirty=false;syncStrategySummary();syncExecutionCapLimit();renderEntryLimits();renderResumeControl();});
